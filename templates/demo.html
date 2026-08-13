@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Self Forcing</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.0/socket.io.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .main-layout {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+            margin-top: 20px;
+        }
+        .left-column {
+            padding-right: 15px;
+        }
+        .right-column {
+            padding-left: 15px;
+        }
+        @media (max-width: 768px) {
+            .main-layout {
+                grid-template-columns: 1fr;
+                gap: 20px;
+            }
+            .left-column, .right-column {
+                padding: 0;
+            }
+        }
+        .controls {
+            margin-bottom: 20px;
+        }
+        .control-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input, textarea, button, select {
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        textarea {
+            width: 100%;
+            height: 90px;
+            resize: vertical;
+        }
+        input[type="range"] {
+            width: 200px;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button:disabled {
+            background-color: #6c757d;
+            cursor: not-allowed;
+        }
+        .stop-btn {
+            background-color: #dc3545;
+        }
+        .stop-btn:hover {
+            background-color: #c82333;
+        }
+        .video-container {
+            text-align: center;
+            background: #000;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px auto;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+        #videoFrame {
+            max-width: 100%;
+            height: auto;
+            border-radius: 4px;
+        }
+        .progress-container {
+            margin: 20px 0;
+        }
+        .progress-bar {
+            width: 100%;
+            height: 20px;
+            background-color: #e9ecef;
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%;
+            background-color: #007bff;
+            transition: width 0.3s ease;
+        }
+        .status {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .status.info {
+            background-color: #d1ecf1;
+            color: #0c5460;
+        }
+        .status.error {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        .status.success {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .frame-info {
+            color: #666;
+            font-size: 0.9em;
+            margin-top: 10px;
+        }
+        .buffer-info {
+            background-color: #e3f2fd;
+            padding: 15px;
+            border-radius: 4px;
+            margin: 15px 0;
+            color: #1976d2;
+        }
+        .playback-controls {
+            margin: 15px 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+        .playback-controls button {
+            margin: 0 5px;
+            padding: 8px 15px;
+        }
+        #playbackSpeed {
+            width: 80px;
+        }
+        .torch-compile-toggle {
+            background-color: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 6px;
+            padding: 10px;
+            margin: 0;
+            flex: 1;
+            min-width: 120px;
+        }
+        .torch-compile-toggle label {
+            display: flex;
+            align-items: center;
+            font-weight: bold;
+            color: #495057;
+            margin-bottom: 0;
+            font-size: 0.9em;
+        }
+        .torch-compile-toggle input[type="checkbox"] {
+            transform: scale(1.1);
+            margin-right: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚀 Self Forcing</h1>
+
+        <div class="main-layout">
+            <div class="left-column">
+                <div class="controls">
+                    <div class="control-group">
+                        <label for="prompt">Prompt (long, detailed prompts work better):</label>
+                        <textarea id="prompt" placeholder="Describe the video you want to generate..."></textarea>
+
+                        <div style="margin-top: 10px;">
+                            <label>Quick Prompts:</label>
+                            <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 5px;">
+                                <button type="button" onclick="setQuickPrompt('quick-demo-1')" style="background-color: #28a745; font-size: 11px; padding: 8px; width: 100%; text-align: left; white-space: pre-wrap; line-height: 1.3; min-height: 60px; border-radius: 4px; color: white; border: none; cursor: pointer;">A stylish woman walks down a Tokyo street filled with warm glowing neon and animated city signage. She wears a black leather jacket, a long red dress, and black boots, and carries a black purse. She wears sunglasses and red lipstick. She walks confidently and casually. The street is damp and reflective, creating a mirror effect of the colorful lights. Many pedestrians walk about.</button>
+                                <button type="button" onclick="setQuickPrompt('quick-demo-2')" style="background-color: #17a2b8; font-size: 11px; padding: 8px; width: 100%; text-align: left; white-space: pre-wrap; line-height: 1.3; min-height: 60px; border-radius: 4px; color: white; border: none; cursor: pointer;">A white and orange tabby cat is seen happily darting through a dense garden, as if chasing something. Its eyes are wide and happy as it jogs forward, scanning the branches, flowers, and leaves as it walks. The path is narrow as it makes its way between all the plants. the scene is captured from a ground-level angle, following the cat closely, giving a low and intimate perspective. The image is cinematic with warm tones and a grainy texture. The scattered daylight between the leaves and plants above creates a warm contrast, accentuating the cat’s orange fur. The shot is clear and sharp, with a shallow depth of field.</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div style="display: flex; gap: 20px;">
+                        <div class="control-group">
+                            <label for="seed">Seed:</label>
+                            <input type="number" id="seed" value="-1" min="0" max="999999">
+                        </div>
+
+                        <div class="control-group">
+                            <label for="fps">Target FPS: <span id="fpsValue">6</span></label>
+                            <input type="range" id="fps" min="2" max="16" value="6" step="0.5">
+                        </div>
+
+                        <!-- <div class="control-group">
+                            <label for="blocks">Total Blocks: <span id="blocksValue">7</span></label>
+                            <input type="range" id="blocks" min="3" max="10" value="7" step="1">
+                        </div> -->
+                    </div>
+
+                    <div class="control-group">
+                        <div style="display: flex; gap: 15px; align-items: flex-start; flex-wrap: wrap;">
+                            <div class="torch-compile-toggle">
+                                <label>
+                                    <input type="checkbox" id="torchCompile">
+                                    🔥 torch.compile
+                                </label>
+                            </div>
+                            <div class="torch-compile-toggle">
+                                <label>
+                                    <input type="checkbox" id="fp8Toggle">
+                                    ⚡ FP8 Quantization
+                                </label>
+                            </div>
+                            <div class="torch-compile-toggle">
+                                <label>
+                                    <input type="checkbox" id="taehvToggle">
+                                    ⚡ TAEHV VAE
+                                </label>
+                            </div>
+                        </div>
+                        <!-- <div style="font-size: 0.85em; color: #666; margin-top: 5px;">
+                            <strong>Note:</strong> torch.compile and FP8 are one-time toggles (cannot be changed once applied)
+                        </div> -->
+                    </div>
+
+                    <div class="control-group">
+                        <button id="startBtn" onclick="startGeneration()">🚀 Start Generation</button>
+                        <button id="stopBtn" onclick="stopGeneration()" disabled class="stop-btn">⏹️ Stop</button>
+                    </div>
+                </div>
+
+                <div class="progress-container">
+                    <div class="progress-bar">
+                        <div id="progressFill" class="progress-fill" style="width: 0%"></div>
+                    </div>
+                    <div id="progressText">Ready to generate</div>
+                </div>
+            </div>
+
+            <div class="right-column">
+                <div class="buffer-info">
+                    <strong>📦 Frame Buffer:</strong> <span id="bufferCount">0</span> frames ready |
+                    <strong>📺 Displayed:</strong> <span id="displayedCount">0</span> frames
+                    <!-- <strong>⚡ Receive Rate:</strong> <span id="receiveRate">0</span> fps -->
+                </div>
+
+                <div class="playback-controls">
+                    <button id="playBtn" onclick="togglePlayback()" disabled>▶️ Play</button>
+                    <button id="resetBtn" onclick="resetPlayback()" disabled>⏮️ Reset</button>
+                    <label for="playbackSpeed">Speed:</label>
+                    <select id="playbackSpeed" onchange="updatePlaybackSpeed()">
+                        <option value="0.25">0.25x</option>
+                        <option value="0.5">0.5x</option>
+                        <option value="0.75">0.75x</option>
+                        <option value="1" selected>1x</option>
+                        <option value="1.25">1.25x</option>
+                        <option value="1.5">1.5x</option>
+                        <option value="2">2x</option>
+                    </select>
+                </div>
+
+                <div id="statusContainer"></div>
+
+                <div class="video-container">
+                    <img id="videoFrame" src="" alt="Video frames will appear here" style="display: none;">
+                    <div id="placeholderText">Click "Start Generation" to begin</div>
+                    <div id="frameInfo" class="frame-info"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const socket = io();
+        let frameBuffer = [];  // Store all received frames
+        let currentFrameIndex = 0;
+        let isPlaying = false;
+        let playbackInterval = null;
+        let targetFps = 6;
+        let playbackSpeed = 1.0;
+        let startTime = null;
+        let lastReceiveTime = null;
+        let receiveCount = 0;
+        let receiveRate = 0;
+
+        // State tracking for one-time toggles
+        let torchCompileApplied = false;
+        let fp8Applied = false;
+
+        // Update slider values
+        document.getElementById('fps').oninput = function() {
+            targetFps = parseFloat(this.value);
+            document.getElementById('fpsValue').textContent = this.value;
+            updatePlaybackTiming();
+        };
+
+        // document.getElementById('blocks').oninput = function() {
+        //     document.getElementById('blocksValue').textContent = this.value;
+        // };
+
+        // Handle toggle behavior and fetch current status
+        function updateToggleStates() {
+            fetch('/api/status')
+                .then(response => response.json())
+                .then(data => {
+                    torchCompileApplied = data.torch_compile_applied;
+                    fp8Applied = data.fp8_applied;
+
+                    // Update UI based on current state
+                    const torchToggle = document.getElementById('torchCompile');
+                    const fp8Toggle = document.getElementById('fp8Toggle');
+                    const taehvToggle = document.getElementById('taehvToggle');
+
+                    // Disable one-time toggles if already applied
+                    if (torchCompileApplied) {
+                        torchToggle.checked = true;
+                        torchToggle.disabled = true;
+                        torchToggle.parentElement.style.opacity = '0.6';
+                    }
+
+                    if (fp8Applied) {
+                        fp8Toggle.checked = true;
+                        fp8Toggle.disabled = true;
+                        fp8Toggle.parentElement.style.opacity = '0.6';
+                    }
+
+                    // Set TAEHV toggle based on current state
+                    taehvToggle.checked = data.current_use_taehv;
+                })
+                .catch(err => console.log('Status check failed:', err));
+        }
+
+        // Handle torch.compile toggle
+        document.getElementById('torchCompile').onchange = function() {
+            if (torchCompileApplied && !this.checked) {
+                this.checked = true; // Prevent unchecking
+                alert('torch.compile cannot be disabled once applied');
+            }
+        };
+
+        // Handle FP8 toggle
+        document.getElementById('fp8Toggle').onchange = function() {
+            if (fp8Applied && !this.checked) {
+                this.checked = true; // Prevent unchecking
+                alert('FP8 quantization cannot be disabled once applied');
+            }
+        };
+
+        // Update toggle states on page load
+        updateToggleStates();
+
+        // Socket event handlers
+        socket.on('connect', function() {
+            // showStatus('Connected to frontend-buffered server', 'info');
+        });
+
+        socket.on('status', function(data) {
+            // showStatus(data.message, 'info');
+        });
+
+        socket.on('progress', function(data) {
+            updateProgress(data.progress, data.message);
+        });
+
+        socket.on('frame_ready', function(data) {
+            // Add frame to buffer immediately
+            frameBuffer.push(data);
+            receiveCount++;
+
+            // Calculate receive rate
+            const now = Date.now();
+            if (lastReceiveTime) {
+                const interval = (now - lastReceiveTime) / 1000;
+                receiveRate = (1 / interval).toFixed(1);
+            }
+            lastReceiveTime = now;
+
+            updateBufferInfo();
+
+            // Auto-start playback when we have some frames
+            if (frameBuffer.length === 5 && !isPlaying) {
+                // showStatus('Auto-starting playback with buffer of 5 frames', 'info');
+                startPlayback();
+            }
+        });
+
+        socket.on('generation_complete', function(data) {
+            // showStatus(data.message + ` (Generated in ${data.generation_time})`, 'success');
+            enableControls(true);
+            const duration = startTime ? ((Date.now() - startTime) / 1000).toFixed(1) : 'unknown';
+            updateFrameInfo(`Generation complete! ${data.total_frames} frames in ${duration}s`);
+
+            // Update toggle states after generation
+            updateToggleStates();
+        });
+
+        socket.on('error', function(data) {
+            // showStatus(`Error: ${data.message}`, 'error');
+            enableControls(true);
+        });
+
+        function startGeneration() {
+            const prompt = document.getElementById('prompt').value.trim();
+            if (!prompt) {
+                alert('Please enter a prompt');
+                return;
+            }
+
+            const seed = parseInt(document.getElementById('seed').value) || 31337;
+            // const totalBlocks = parseInt(document.getElementById('blocks').value) || 7;
+            const enableTorchCompile = document.getElementById('torchCompile').checked;
+            const enableFp8 = document.getElementById('fp8Toggle').checked;
+            const useTaehv = document.getElementById('taehvToggle').checked;
+
+            // Reset state
+            frameBuffer = [];
+            currentFrameIndex = 0;
+            receiveCount = 0;
+            receiveRate = 0;
+            stopPlayback();
+
+            enableControls(false);
+            startTime = Date.now();
+
+            socket.emit('start_generation', {
+                prompt: prompt,
+                seed: seed,
+                enable_torch_compile: enableTorchCompile,
+                enable_fp8: enableFp8,
+                use_taehv: useTaehv
+            });
+        }
+
+        function stopGeneration() {
+            socket.emit('stop_generation');
+            enableControls(true);
+        }
+
+        function togglePlayback() {
+            if (isPlaying) {
+                stopPlayback();
+            } else {
+                startPlayback();
+            }
+        }
+
+        function startPlayback() {
+            if (frameBuffer.length === 0) return;
+
+            isPlaying = true;
+            document.getElementById('playBtn').textContent = '⏸️ Pause';
+            document.getElementById('playBtn').disabled = false;
+            document.getElementById('resetBtn').disabled = false;
+
+            updatePlaybackTiming();
+            // showStatus('Playback started', 'info');
+        }
+
+        function stopPlayback() {
+            isPlaying = false;
+            if (playbackInterval) {
+                clearInterval(playbackInterval);
+                playbackInterval = null;
+            }
+            document.getElementById('playBtn').textContent = '▶️ Play';
+        }
+
+        function resetPlayback() {
+            stopPlayback();
+
+            // Clear the entire frame buffer
+            frameBuffer = [];
+            currentFrameIndex = 0;
+            receiveCount = 0;
+            receiveRate = 0;
+
+            // Reset video display to initial state
+            const img = document.getElementById('videoFrame');
+            const placeholder = document.getElementById('placeholderText');
+
+            img.src = '';
+            img.style.display = 'none';
+            placeholder.style.display = 'block';
+
+            // Update UI
+            updateBufferInfo();
+            updateFrameInfo('Reset - buffer cleared');
+
+            // Disable playback controls since there's no content
+            document.getElementById('playBtn').disabled = true;
+            document.getElementById('resetBtn').disabled = true;
+        }
+
+        function updatePlaybackSpeed() {
+            playbackSpeed = parseFloat(document.getElementById('playbackSpeed').value);
+            if (isPlaying) {
+                updatePlaybackTiming();
+            }
+        }
+
+        function updatePlaybackTiming() {
+            if (playbackInterval) {
+                clearInterval(playbackInterval);
+            }
+
+            if (isPlaying) {
+                const interval = (1000 / targetFps) / playbackSpeed;
+                playbackInterval = setInterval(displayNextFrame, interval);
+            }
+        }
+
+        function displayNextFrame() {
+            if (currentFrameIndex >= frameBuffer.length) {
+                // Reached end of buffer
+                if (document.querySelector('#progressFill').style.width === '100%') {
+                    // Generation complete, stop playback
+                    stopPlayback();
+                    // showStatus('Playback complete', 'success');
+                }
+                return;
+            }
+
+            const frameData = frameBuffer[currentFrameIndex];
+            displayFrame(frameData);
+            currentFrameIndex++;
+
+            updateBufferInfo();
+        }
+
+        function displayFrame(frameData) {
+            const img = document.getElementById('videoFrame');
+            const placeholder = document.getElementById('placeholderText');
+
+            img.src = frameData.data;
+            img.style.display = 'block';
+            placeholder.style.display = 'none';
+
+            const elapsed = startTime ? ((Date.now() - startTime) / 1000).toFixed(1) : '0';
+            updateFrameInfo(`Frame ${frameData.frame_index + 1} | Block ${frameData.block_index + 1} | ${elapsed}s elapsed | ${targetFps} FPS @ ${playbackSpeed}x speed`);
+        }
+
+        function updateBufferInfo() {
+            document.getElementById('bufferCount').textContent = frameBuffer.length;
+            document.getElementById('displayedCount').textContent = currentFrameIndex;
+            // document.getElementById('receiveRate').textContent = receiveRate;
+        }
+
+        function setQuickPrompt(type) {
+            const promptBox = document.getElementById('prompt');
+            if (type === 'quick-demo-1') {
+                promptBox.value = 'A stylish woman walks down a Tokyo street filled with warm glowing neon and animated city signage. She wears a black leather jacket, a long red dress, and black boots, and carries a black purse. She wears sunglasses and red lipstick. She walks confidently and casually. The street is damp and reflective, creating a mirror effect of the colorful lights. Many pedestrians walk about.';
+            } else if (type === 'quick-demo-2') {
+                promptBox.value = 'A white and orange tabby cat is seen happily darting through a dense garden, as if chasing something. Its eyes are wide and happy as it jogs forward, scanning the branches, flowers, and leaves as it walks. The path is narrow as it makes its way between all the plants. the scene is captured from a ground-level angle, following the cat closely, giving a low and intimate perspective. The image is cinematic with warm tones and a grainy texture. The scattered daylight between the leaves and plants above creates a warm contrast, accentuating the cat’s orange fur. The shot is clear and sharp, with a shallow depth of field.';
+            }
+        }
+
+        function enableControls(enabled) {
+            document.getElementById('startBtn').disabled = !enabled;
+            document.getElementById('stopBtn').disabled = enabled;
+        }
+
+        function updateProgress(progress, message) {
+            document.getElementById('progressFill').style.width = progress + '%';
+            document.getElementById('progressText').textContent = message;
+        }
+
+        function updateFrameInfo(text) {
+            document.getElementById('frameInfo').textContent = text;
+        }
+
+        function showStatus(message, type) {
+            const container = document.getElementById('statusContainer');
+            const statusDiv = document.createElement('div');
+            statusDiv.className = `status ${type}`;
+            statusDiv.textContent = message;
+
+            container.insertBefore(statusDiv, container.firstChild);
+
+            // Remove old status messages (keep only last 3)
+            while (container.children.length > 3) {
+                container.removeChild(container.lastChild);
+            }
+
+            // Auto-remove after 5 seconds
+            setTimeout(() => {
+                if (statusDiv.parentNode) {
+                    statusDiv.parentNode.removeChild(statusDiv);
+                }
+            }, 5000);
+        }
+    </script>
+</body>
+</html>

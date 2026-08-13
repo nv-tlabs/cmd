@@ -1,0 +1,5 @@
+huggingface_hub
+tqdm
+pandas
+transformers
+easydict

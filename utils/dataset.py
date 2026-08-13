@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaOneWayNoncommercial
+
 from utils.lmdb import get_array_shape_from_lmdb, retrieve_row_from_lmdb
 from torch.utils.data import Dataset
 import numpy as np

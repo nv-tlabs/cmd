@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaOneWayNoncommercial
+
 """Small runtime helpers needed by the vendored Cosmos-Predict2.5 DiT.
 
 The training integration does not use NVIDIA's context-parallel or neighborhood

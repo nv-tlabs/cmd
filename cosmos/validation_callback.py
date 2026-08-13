@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaOneWayNoncommercial
+
 """Periodic causal-I2V validation for Cosmos training."""
 
 import time

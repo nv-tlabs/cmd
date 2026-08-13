@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaOneWayNoncommercial
+
 from pipeline import SelfForcingTrainingPipeline
 from typing import Optional, Tuple
 import torch

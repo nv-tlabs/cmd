@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Self-Forcing Authors. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # SPDX-FileCopyrightText: Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaOneWayNoncommercial
 
@@ -14,6 +29,7 @@ import wandb
 import time
 import os
 
+from cosmos.camera_conditioning import build_camera_conditioning
 from utils.distributed import EMA_FSDP, barrier, fsdp_wrap, fsdp_state_dict, launch_distributed_job
 
 
@@ -85,7 +101,11 @@ class Trainer:
         )
 
         # Step 3: Initialize the dataloader
-        dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
+        dataset = ShardingLMDBDataset(
+            config.data_path,
+            max_pair=int(1e8),
+            load_camera=bool(getattr(config, "camera_conditioning", False)),
+        )
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, shuffle=True, drop_last=True)
         dataloader = torch.utils.data.DataLoader(
@@ -207,6 +227,28 @@ class Trainer:
                 self.unconditional_dict = unconditional_dict  # cache the unconditional_dict
             else:
                 unconditional_dict = self.unconditional_dict
+
+            if getattr(self.config, "camera_conditioning", False):
+                if "camera_poses" not in batch or "camera_intrinsics" not in batch:
+                    raise RuntimeError(
+                        "Camera-conditioned training requires camera_poses and "
+                        "camera_intrinsics in every batch"
+                    )
+                conditional_dict["camera_condition"] = build_camera_conditioning(
+                    batch["camera_poses"].to(device=self.device, dtype=torch.float32),
+                    batch["camera_intrinsics"].to(
+                        device=self.device,
+                        dtype=torch.float32,
+                    ),
+                    image_height=int(self.config.height),
+                    image_width=int(self.config.width),
+                    frame_stride=int(
+                        getattr(self.config, "camera_frame_stride", 4)
+                    ),
+                    patch_size=int(getattr(self.config, "camera_patch_size", 16)),
+                    expected_latent_frames=clean_latent.shape[1],
+                    output_dtype=self.dtype,
+                )
 
         # Step 3: Train the generator
         generator_loss, log_dict = self.model.generator_loss(

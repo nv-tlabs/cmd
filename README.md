@@ -36,10 +36,31 @@ python setup.py develop
 
 ## Stage 1: Teacher Pretraining
 
+### Camera Conditioned Teacher Pretraining
+
+[`configs/cosmos/causal_flow_camera_finetune.yaml`](configs/cosmos/causal_flow_camera_finetune.yaml)
+
+```bash
+source scripts/setup_huggingface.sh
+export COSMOS_RUN_DIR="logs/dl3dv_camera_flow"
+export WANDB_DIR="${COSMOS_RUN_DIR}/wandb"
+source scripts/setup_wandb.sh
+torchrun --standalone --nproc-per-node=8 \
+  train.py \
+  --config_path configs/cosmos/causal_flow_camera_finetune.yaml \
+  --logdir "${COSMOS_RUN_DIR}" \
+  --wandb-save-dir "${WANDB_DIR}"
+```
+
+### Short Video Teacher Pretraining
+
 [`configs/cosmos/causal_flow_finetune.yaml`](configs/cosmos/causal_flow_finetune.yaml)
 
 ```bash
 source scripts/setup_huggingface.sh
+
+export COSMOS_RUN_DIR="logs/dl3dv_causal_flow"
+export WANDB_DIR="${COSMOS_RUN_DIR}/wandb"
 source scripts/setup_wandb.sh
 
 torchrun --standalone --nproc-per-node=8 \
@@ -50,6 +71,26 @@ torchrun --standalone --nproc-per-node=8 \
 ```
 
 ## Stage 2: Context-Matched Distillation
+
+### Camera Conditioned Distillation
+
+[`configs/cosmos/camera_distillation.yaml`](configs/cosmos/camera_distillation.yaml)
+
+```bash
+source scripts/setup_huggingface.sh
+
+export COSMOS_RUN_DIR="logs/dl3dv_camera_distillation"
+export WANDB_DIR="${COSMOS_RUN_DIR}/wandb"
+source scripts/setup_wandb.sh
+
+torchrun --standalone --nproc-per-node=8 \
+  train.py \
+  --config_path configs/cosmos/camera_distillation.yaml \
+  --logdir "${COSMOS_RUN_DIR}" \
+  --wandb-save-dir "${WANDB_DIR}"
+```
+
+### Short Video Distillation
 
 [`configs/cosmos/context_matched_distillation.yaml`](configs/cosmos/context_matched_distillation.yaml)
 

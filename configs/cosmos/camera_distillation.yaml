@@ -1,0 +1,87 @@
+# Camera-conditioned distillation initialized from the camera flow model.
+generator_ckpt: logs/dl3dv_camera_flow/checkpoint_model_000500/model.pt
+teacher_ckpt: logs/dl3dv_camera_flow/checkpoint_model_000500/model.pt
+prefix_noise: 256
+model_family: cosmos
+real_name: nvidia/Cosmos-Predict2.5-2B
+fake_name: nvidia/Cosmos-Predict2.5-2B
+text_encoder_name: nvidia/Cosmos-Reason1-7B
+vae_model_name: nvidia/Cosmos-Predict2.5-2B
+
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: true
+same_step_across_blocks: true
+last_step_only: false
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 5.0
+context_noise: 128
+validation_interval: 50
+validation_at_start: true
+validation_seed: 12345
+validation_fps: 16
+real_guidance_scale: 4.0
+fake_guidance_scale: 0.0
+denoising_loss_type: flow
+mixed_precision: true
+seed: 0
+wandb_host: ${oc.env:WANDB_BASE_URL,https://api.wandb.ai}
+wandb_key: null
+wandb_entity: ${oc.env:WANDB_ENTITY,null}
+wandb_project: ${oc.env:WANDB_PROJECT,causal-cosmos25}
+sharding_strategy: hybrid_full
+
+lr: 6.0e-6
+lr_critic: 1.2e-6
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+
+data_path: data/cosmos_i2v_lmdb
+batch_size: 1
+grad_accum_iter: 2
+ema_weight: 0.0
+ema_start_step: 200
+log_iters: 50
+max_steps: 10000
+negative_prompt: >-
+  The video captures a series of frames showing ugly scenes, static with no
+  motion, motion blur, over-saturation, shaky footage, low resolution, grainy
+  texture, pixelated images, poorly lit areas, underexposed and overexposed
+  scenes, poor color balance, washed out colors, choppy sequences, jerky
+  movements, low frame rate, artifacting, color banding, unnatural transitions,
+  outdated special effects, fake elements, unconvincing visuals, poorly edited
+  content, jump cuts, visual noise, and flickering. Overall, the video is of
+  poor quality.
+dfake_gen_update_ratio: 5
+
+image_or_video_shape: [1, 24, 16, 60, 104]
+distribution_loss: context_matched
+trainer: score_distillation
+gradient_checkpointing: true
+num_frame_per_block: 1
+load_raw_video: false
+i2v: true
+independent_first_frame: true
+num_training_frames: 24
+
+# The 93 stored DL3DV cameras are used as-is; no translation scale is applied.
+camera_conditioning: true
+camera_frame_stride: 4
+camera_patch_size: 16
+
+model_kwargs:
+  model_name: nvidia/Cosmos-Predict2.5-2B
+  checkpoint_filename: base/post-trained/81edfebe-bd6a-4039-8c1d-737df1a790bf_ema_bf16.pt
+  timestep_shift: 5.0
+  i2v: true
+  local_attn_size: 21
+  sink_size: 0
+  camera_conditioning: true
+  camera_patch_size: 16
+  camera_init_seed: 0

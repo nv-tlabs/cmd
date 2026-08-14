@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Self-Forcing Authors. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # SPDX-FileCopyrightText: Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaOneWayNoncommercial
 
@@ -10,8 +25,7 @@ from utils.model_factory import (
     build_text_encoder,
     build_vae,
 )
-
-from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation
+from cosmos.camera_conditioning import build_camera_conditioning
 
 
 class CausalInferencePipeline(torch.nn.Module):
@@ -65,10 +79,12 @@ class CausalInferencePipeline(torch.nn.Module):
         noise: torch.Tensor,
         text_prompts: List[str],
         initial_latent: Optional[torch.Tensor] = None,
+        camera_poses: Optional[torch.Tensor] = None,
+        camera_intrinsics: Optional[torch.Tensor] = None,
+        camera_condition: Optional[torch.Tensor] = None,
         return_latents: bool = False,
         decode: bool = True,
         profile: bool = False,
-        low_memory: bool = False,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -110,10 +126,26 @@ class CausalInferencePipeline(torch.nn.Module):
             conditional_dict["initial_latent"] = initial_latent
             if unconditional_dict is not None:
                 unconditional_dict["initial_latent"] = initial_latent
-
-        if low_memory:
-            gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
-            move_model_to_device_with_memory_preservation(self.text_encoder, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+        if getattr(self.args, "camera_conditioning", False):
+            if camera_condition is None:
+                if camera_poses is None or camera_intrinsics is None:
+                    raise ValueError(
+                        "Camera-conditioned inference requires camera_poses and "
+                        "camera_intrinsics, or a precomputed camera_condition"
+                    )
+                camera_condition = build_camera_conditioning(
+                    camera_poses.to(device=noise.device, dtype=torch.float32),
+                    camera_intrinsics.to(device=noise.device, dtype=torch.float32),
+                    image_height=int(self.args.height),
+                    image_width=int(self.args.width),
+                    frame_stride=int(getattr(self.args, "camera_frame_stride", 4)),
+                    patch_size=int(getattr(self.args, "camera_patch_size", 16)),
+                    expected_latent_frames=num_output_frames,
+                    output_dtype=noise.dtype,
+                )
+            conditional_dict["camera_condition"] = camera_condition
+            if unconditional_dict is not None:
+                unconditional_dict["camera_condition"] = camera_condition
 
         output = torch.zeros(
             [batch_size, num_output_frames, num_channels, height, width],

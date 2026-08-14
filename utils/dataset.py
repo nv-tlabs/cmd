@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Self-Forcing Authors. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # SPDX-FileCopyrightText: Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaOneWayNoncommercial
 
@@ -73,9 +88,15 @@ class ODERegressionLMDBDataset(Dataset):
 
 
 class ShardingLMDBDataset(Dataset):
-    def __init__(self, data_path: str, max_pair: int = int(1e8)):
+    def __init__(
+        self,
+        data_path: str,
+        max_pair: int = int(1e8),
+        load_camera: bool = False,
+    ):
         self.envs = []
         self.index = []
+        self.load_camera = load_camera
 
         shard_paths = sorted(
             path.parent
@@ -92,8 +113,39 @@ class ShardingLMDBDataset(Dataset):
             self.envs.append(env)
 
         self.latents_shape = [None] * len(self.envs)
+        self.camera_poses_shape = [None] * len(self.envs)
+        self.camera_intrinsics_shape = [None] * len(self.envs)
         for shard_id, env in enumerate(self.envs):
             self.latents_shape[shard_id] = get_array_shape_from_lmdb(env, 'latents')
+            if self.load_camera:
+                with env.begin() as txn:
+                    has_poses = txn.get(b"camera_poses_shape") is not None
+                    has_intrinsics = txn.get(b"camera_intrinsics_shape") is not None
+                if not has_poses or not has_intrinsics:
+                    raise ValueError(
+                        f"Camera conditioning requested, but LMDB shard {shard_paths[shard_id]} "
+                        "does not contain camera_poses and camera_intrinsics"
+                    )
+                self.camera_poses_shape[shard_id] = get_array_shape_from_lmdb(
+                    env, "camera_poses"
+                )
+                self.camera_intrinsics_shape[shard_id] = get_array_shape_from_lmdb(
+                    env, "camera_intrinsics"
+                )
+                if (
+                    self.camera_poses_shape[shard_id][0]
+                    != self.latents_shape[shard_id][0]
+                ):
+                    raise ValueError(
+                        "Camera pose and latent counts differ in an LMDB shard"
+                    )
+                if (
+                    self.camera_intrinsics_shape[shard_id][0]
+                    != self.latents_shape[shard_id][0]
+                ):
+                    raise ValueError(
+                        "Camera intrinsics and latent counts differ in an LMDB shard"
+                    )
             for local_i in range(self.latents_shape[shard_id][0]):
                 self.index.append((shard_id, local_i))
 
@@ -126,10 +178,31 @@ class ShardingLMDBDataset(Dataset):
             "prompts", str, local_idx
         )
 
-        return {
+        sample = {
             "prompts": prompts,
             "ode_latent": torch.tensor(latents, dtype=torch.float32)
         }
+        if self.load_camera:
+            camera_poses = retrieve_row_from_lmdb(
+                self.envs[shard_id],
+                "camera_poses",
+                np.float32,
+                local_idx,
+                shape=self.camera_poses_shape[shard_id][1:],
+            )
+            camera_intrinsics = retrieve_row_from_lmdb(
+                self.envs[shard_id],
+                "camera_intrinsics",
+                np.float32,
+                local_idx,
+                shape=self.camera_intrinsics_shape[shard_id][1:],
+            )
+            sample["camera_poses"] = torch.tensor(camera_poses, dtype=torch.float32)
+            sample["camera_intrinsics"] = torch.tensor(
+                camera_intrinsics,
+                dtype=torch.float32,
+            )
+        return sample
 
 
 class TextImagePairDataset(Dataset):

@@ -1,0 +1,58 @@
+Self-Forcing-Cosmos25
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This distribution contains code derived from third-party open-source projects.
+The original portions identified below remain subject to their original
+licenses. NVIDIA modifications are separately identified in modified source
+files and are subject to the NVIDIA OneWay Noncommercial License in LICENSE.
+This NOTICE is informational and does not alter any applicable license.
+
+A copy of the Apache License, Version 2.0 is provided at
+LICENSES/Apache-2.0.txt.
+
+Wan2.1
+-------
+Source: https://github.com/Wan-Video/Wan2.1
+Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+License: Apache License 2.0
+Paths: wan/ (except wan/modules/causal_model.py, listed under Self-Forcing)
+
+The Wan tree also retains its embedded provenance notices for code adapted
+from projects such as Hugging Face Diffusers, CLIP, OpenCLIP, Transformers,
+and qwen-vl-utils.
+
+Self-Forcing
+------------
+Source: https://github.com/guandeh17/Self-Forcing
+Copyright (c) 2025 The Self-Forcing Authors. All rights reserved.
+License: Apache License 2.0
+Paths containing original or modified Self-Forcing code:
+  inference.py
+  setup.py
+  train.py
+  model/
+  pipeline/
+  trainer/
+  wan/modules/causal_model.py
+  scripts/create_lmdb_14b_shards.py
+  scripts/create_lmdb_iterative.py
+  scripts/generate_ode_pairs.py
+  utils/dataset.py
+  utils/distributed.py
+  utils/lmdb.py
+  utils/loss.py
+  utils/misc.py
+  utils/scheduler.py
+  utils/wan_wrapper.py
+
+NVIDIA Cosmos-Predict2.5
+------------------------
+Source: https://github.com/nvidia-cosmos/cosmos-predict2.5
+Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+License: Apache License 2.0
+Paths containing original or modified Cosmos-Predict2.5 code:
+  cosmos/kv_cache.py
+  cosmos/minimal_v1_lvg_dit.py
+  cosmos/minimal_v4_dit.py
+  cosmos/model_weights_stats.py
+  cosmos/selective_activation_checkpoint.py

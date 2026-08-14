@@ -19,7 +19,6 @@ einops
 av>=16.0.1
 git+https://github.com/openai/CLIP.git
 open_clip_torch
-starlette
 pycocotools
 lmdb
 matplotlib
@@ -27,14 +26,3 @@ sentencepiece
 pydantic>=2.11.7
 scikit-image
 huggingface_hub[cli]
-dominate
-nvidia-pyindex
-nvidia-tensorrt
-pycuda
-onnx
-onnxruntime
-onnxscript
-onnxconverter_common
-flask
-flask-socketio
-torchao

@@ -93,6 +93,16 @@ class CosmosValidationCallback:
                 noise=noise,
                 text_prompts=prompts,
                 initial_latent=initial_latent,
+                camera_poses=(
+                    batch["camera_poses"]
+                    if getattr(self.config, "camera_conditioning", False)
+                    else None
+                ),
+                camera_intrinsics=(
+                    batch["camera_intrinsics"]
+                    if getattr(self.config, "camera_conditioning", False)
+                    else None
+                ),
                 return_latents=True,
                 decode=False,
             )

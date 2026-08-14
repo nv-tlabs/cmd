@@ -42,6 +42,7 @@ class MinimalV1LVGDiT(MiniTrainDIT):
         data_type: Optional[DataType] = DataType.VIDEO,
         intermediate_feature_ids: Optional[List[int]] = None,
         img_context_emb: Optional[torch.Tensor] = None,
+        camera_condition_B_C_T_H_W: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         del kwargs
@@ -62,4 +63,5 @@ class MinimalV1LVGDiT(MiniTrainDIT):
             data_type=data_type,
             intermediate_feature_ids=intermediate_feature_ids,
             img_context_emb=img_context_emb,
+            camera_condition_B_C_T_H_W=camera_condition_B_C_T_H_W,
         )

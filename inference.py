@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Self-Forcing Authors. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # SPDX-FileCopyrightText: Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaOneWayNoncommercial
 
@@ -19,8 +34,6 @@ from pipeline import (
 )
 from utils.dataset import TextDataset, TextImagePairDataset
 from utils.misc import set_seed
-
-from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, help="Path to the config file")
@@ -52,9 +65,6 @@ else:
     world_size = 1
     set_seed(args.seed)
 
-print(f'Free VRAM {get_cuda_free_memory_gb(gpu)} GB')
-low_memory = get_cuda_free_memory_gb(gpu) < 40
-
 torch.set_grad_enabled(False)
 
 config = OmegaConf.load(args.config_path)
@@ -81,12 +91,9 @@ if args.checkpoint_path:
     pipeline.generator.load_state_dict(state_dict['generator' if not args.use_ema else 'generator_ema'])
 
 pipeline = pipeline.to(dtype=torch.bfloat16)
-if low_memory:
-    DynamicSwapInstaller.install_model(pipeline.text_encoder, device=gpu)
-else:
-    pipeline.text_encoder.to(device=gpu)
-pipeline.generator.to(device=gpu)
-pipeline.vae.to(device=gpu)
+pipeline.text_encoder.to(device=device)
+pipeline.generator.to(device=device)
+pipeline.vae.to(device=device)
 
 
 # Create dataset
@@ -182,7 +189,6 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         text_prompts=prompts,
         return_latents=True,
         initial_latent=initial_latent,
-        low_memory=low_memory,
     )
     current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
     all_video.append(current_video)

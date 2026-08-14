@@ -1,0 +1,75 @@
+# T24 camera-conditioned causal flow matching on DL3DV.
+model_family: cosmos
+text_encoder_name: nvidia/Cosmos-Reason1-7B
+vae_model_name: nvidia/Cosmos-Predict2.5-2B
+
+trainer: diffusion
+denoising_loss_type: flow
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 7.0
+teacher_forcing: false
+noise_augmentation_max_timestep: 0
+warp_denoising_step: true
+
+generator_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+sharding_strategy: hybrid_full
+mixed_precision: true
+gradient_checkpointing: true
+
+lr: 6.0e-5
+beta1: 0.0
+beta2: 0.999
+weight_decay: 0.01
+max_grad_norm: 0.1
+batch_size: 1
+seed: 0
+
+data_path: data/cosmos_i2v_lmdb
+load_raw_video: false
+image_or_video_shape: [1, 24, 16, 60, 104]
+i2v: true
+independent_first_frame: true
+num_frame_per_block: 1
+
+# Existing records contain 93 pixel-frame cameras. Stride four selects
+# frames 0, 4, ..., 92 for the 24 VAE latents. Camera translations are used
+# exactly as stored; this configuration applies no dataset-dependent scale.
+camera_conditioning: true
+camera_frame_stride: 4
+camera_patch_size: 16
+
+ema_weight: 0.0
+ema_start_step: 0
+log_iters: 50
+max_steps: 100000
+negative_prompt: >-
+  The video captures a series of frames showing ugly scenes, static with no
+  motion, motion blur, over-saturation, shaky footage, low resolution, grainy
+  texture, pixelated images, poorly lit areas, underexposed and overexposed
+  scenes, poor color balance, washed out colors, choppy sequences, jerky
+  movements, low frame rate, artifacting, color banding, unnatural transitions,
+  outdated special effects, fake elements, unconvincing visuals, poorly edited
+  content, jump cuts, visual noise, and flickering. Overall, the video is of
+  poor quality.
+num_inference_steps: 35
+context_noise: 128
+validation_interval: 100
+validation_at_start: true
+validation_seed: 12345
+validation_fps: 16
+wandb_host: ${oc.env:WANDB_BASE_URL,https://api.wandb.ai}
+wandb_key: null
+wandb_entity: ${oc.env:WANDB_ENTITY,null}
+wandb_project: ${oc.env:WANDB_PROJECT,causal-cosmos25}
+
+model_kwargs:
+  model_name: nvidia/Cosmos-Predict2.5-2B
+  checkpoint_filename: base/post-trained/81edfebe-bd6a-4039-8c1d-737df1a790bf_ema_bf16.pt
+  timestep_shift: 5.0
+  i2v: true
+  local_attn_size: 21
+  camera_conditioning: true
+  camera_patch_size: 16
+  camera_init_seed: 0

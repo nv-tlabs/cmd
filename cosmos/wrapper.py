@@ -7,6 +7,8 @@ import types
 from typing import List, Optional
 
 import torch
+
+from cosmos.camera_conditioning import CAMERA_FEATURE_DIM
 from huggingface_hub import hf_hub_download
 
 from utils.scheduler import FlowMatchScheduler, SchedulerInterface
@@ -181,11 +183,18 @@ class CosmosDiffusionWrapper(torch.nn.Module):
         local_attn_size: int = -1,
         sink_size: int = 0,
         i2v: bool = True,
+        camera_conditioning: bool = False,
+        camera_patch_size: int = 16,
+        camera_init_seed: int = 0,
     ) -> None:
         super().__init__()
         self.is_causal = is_causal
         self.i2v = i2v
         self.local_attn_size = local_attn_size
+        self.camera_conditioning = bool(camera_conditioning)
+        self.camera_patch_size = int(camera_patch_size)
+        if self.camera_patch_size <= 0:
+            raise ValueError("camera_patch_size must be positive")
         self.uniform_timestep = not is_causal
         self._cache_max_frames = 128
         self._gradient_checkpointing = False
@@ -197,6 +206,11 @@ class CosmosDiffusionWrapper(torch.nn.Module):
             local_attn_size=local_attn_size,
             sink_size=sink_size,
         ).eval()
+        if self.camera_conditioning:
+            self.model.enable_camera_conditioning(
+                camera_dim=CAMERA_FEATURE_DIM * self.camera_patch_size**2,
+                init_seed=int(camera_init_seed),
+            )
 
         if is_causal:
             self._kv_attention_ops = [
@@ -384,6 +398,62 @@ class CosmosDiffusionWrapper(torch.nn.Module):
             timestep[:, :cond_frames] = 0
         return noisy_video, timestep, mask
 
+    def _camera_condition(
+        self,
+        conditional_dict: dict,
+        model_input: torch.Tensor,
+        *,
+        current_start: Optional[int],
+        streaming: bool,
+    ) -> Optional[torch.Tensor]:
+        camera = conditional_dict.get("camera_condition")
+        if not self.camera_conditioning:
+            if camera is not None:
+                raise ValueError(
+                    "camera_condition was provided, but camera_conditioning is disabled"
+                )
+            return None
+        if camera is None:
+            raise ValueError(
+                "camera_conditioning is enabled, but conditional_dict has no camera_condition"
+            )
+        if camera.ndim != 5:
+            raise ValueError(
+                "camera_condition must have shape [B, C, T, H, W]; got "
+                f"{tuple(camera.shape)}"
+            )
+
+        target_frames = model_input.shape[1]
+        start = int(current_start or 0) if streaming else 0
+        if camera.shape[2] >= start + target_frames:
+            camera = camera[:, :, start : start + target_frames]
+        elif camera.shape[2] != target_frames:
+            raise ValueError(
+                "Camera conditioning is too short for the requested video frames: "
+                f"start={start}, frames={target_frames}, camera_frames={camera.shape[2]}"
+            )
+
+        expected_spatial_grid = (
+            model_input.shape[-2] // self.model.patch_spatial,
+            model_input.shape[-1] // self.model.patch_spatial,
+        )
+        if camera.shape[-2:] != expected_spatial_grid:
+            raise ValueError(
+                "Camera and video spatial token grids do not match: camera="
+                f"{tuple(camera.shape[-2:])}, video="
+                f"{expected_spatial_grid}"
+            )
+        if camera.shape[0] != model_input.shape[0]:
+            if model_input.shape[0] % camera.shape[0]:
+                raise ValueError(
+                    "Camera batch cannot be expanded to the model batch: "
+                    f"{camera.shape[0]} and {model_input.shape[0]}"
+                )
+            camera = camera.repeat(
+                model_input.shape[0] // camera.shape[0], 1, 1, 1, 1
+            )
+        return camera
+
     def forward(
         self,
         noisy_image_or_video: torch.Tensor,
@@ -416,12 +486,23 @@ class CosmosDiffusionWrapper(torch.nn.Module):
                 kv_cache is None or int(current_start or 0) == 0
             ),
         )
+        camera_condition = self._camera_condition(
+            conditional_dict,
+            model_input,
+            current_start=current_start,
+            streaming=kv_cache is not None,
+        )
         # Keep flow/noise/target construction in FP32, then cast only at the
         # DiT boundary just like a mixed-precision root module would.
         compute_dtype = self.model.x_embedder.proj[1].weight.dtype
         model_input_bcthw = model_input.to(dtype=compute_dtype).permute(0, 2, 1, 3, 4)
         prompt_embeds = prompt_embeds.to(dtype=compute_dtype)
         condition_mask = condition_mask.to(dtype=compute_dtype)
+        if camera_condition is not None:
+            camera_condition = camera_condition.to(
+                device=model_input.device,
+                dtype=compute_dtype,
+            )
         padding_mask = torch.zeros(
             model_input.shape[0],
             1,
@@ -461,6 +542,7 @@ class CosmosDiffusionWrapper(torch.nn.Module):
                 crossattn_emb=prompt_embeds,
                 padding_mask=padding_mask,
                 condition_video_input_mask_B_C_T_H_W=condition_mask,
+                camera_condition_B_C_T_H_W=camera_condition,
                 kv_cache_cfg=KVCacheConfig(
                     run_with_kv=True,
                     store_kv=should_store_kv,
@@ -474,6 +556,7 @@ class CosmosDiffusionWrapper(torch.nn.Module):
                 crossattn_emb=prompt_embeds,
                 padding_mask=padding_mask,
                 condition_video_input_mask_B_C_T_H_W=condition_mask,
+                camera_condition_B_C_T_H_W=camera_condition,
             ).permute(0, 2, 1, 3, 4)
 
         pred_x0 = self._convert_flow_pred_to_x0(

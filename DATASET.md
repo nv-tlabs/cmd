@@ -114,9 +114,12 @@ contains:
 Generic prompt fallback is disabled. Preprocessing fails if an exact clip key
 is absent from the Qwen caption JSON.
 
-The camera controls are retained in the LMDB for the camera-conditioned stage.
-The first flow-matching stage is I2V-conditioned on the first frame and does
-not yet pass camera matrices into the network.
+The camera controls are retained in the LMDB for camera-conditioned training.
+[`configs/cosmos/causal_flow_camera_finetune.yaml`](configs/cosmos/causal_flow_camera_finetune.yaml)
+uses the existing 93 cameras without translation scaling, samples
+`0, 4, ..., 92` to align them with the 24 VAE latents, and conditions every
+self-attention block with frame-relative ray origins and directions. Launch it
+with the same training command shown in the README, replacing the config path.
 
 DL3DV is distributed under its own terms. Review the
 [DL3DV license](https://github.com/DL3DV-10K/Dataset/blob/main/License.md)

@@ -257,6 +257,7 @@ class CausalCosmosModel(MinimalV1LVGDiT):
         fps: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
         condition_video_input_mask_B_C_T_H_W: Optional[torch.Tensor] = None,
+        camera_condition_B_C_T_H_W: Optional[torch.Tensor] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
     ) -> torch.Tensor:
         """Run one causal sequence chunk using the same blocks and weights."""
@@ -278,6 +279,16 @@ class CausalCosmosModel(MinimalV1LVGDiT):
         _, token_t, token_h, token_w, _ = x_B_T_H_W_D.shape
         if token_t * token_h * token_w != video_pos.size():
             raise ValueError("Cosmos sequence positions do not match the input tokens")
+        camera_B_T_H_W_C = None
+        if camera_condition_B_C_T_H_W is not None:
+            camera_B_T_H_W_C = camera_condition_B_C_T_H_W.permute(
+                0, 2, 3, 4, 1
+            ).contiguous()
+            if camera_B_T_H_W_C.shape[:4] != x_B_T_H_W_D.shape[:4]:
+                raise ValueError(
+                    "Camera conditioning does not match the causal video grid: "
+                    f"{tuple(camera_B_T_H_W_C.shape)} versus {tuple(x_B_T_H_W_D.shape)}"
+                )
 
         if self.use_crossattn_projection:
             crossattn_emb = self.crossattn_proj(crossattn_emb)
@@ -310,6 +321,7 @@ class CausalCosmosModel(MinimalV1LVGDiT):
                 adaln_lora_B_T_3D=adaln_lora,
                 extra_per_block_pos_emb=None,
                 kv_cache_cfg=kv_cache_cfg,
+                camera_B_T_H_W_C=camera_B_T_H_W_C,
             )
 
         output = self.final_layer(

@@ -1179,6 +1179,7 @@ class Block(nn.Module):
             backend=backend,
             use_wan_fp32_strategy=use_wan_fp32_strategy,
         )
+        self.camera_encoder = None
 
         self.layer_norm_cross_attn = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
 
@@ -1267,6 +1268,7 @@ class Block(nn.Module):
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
+        camera_B_T_H_W_C: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
@@ -1315,6 +1317,20 @@ class Block(nn.Module):
             scale_self_attn_B_T_1_1_D,
             shift_self_attn_B_T_1_1_D,
         )
+        if camera_B_T_H_W_C is not None:
+            if self.camera_encoder is None:
+                raise RuntimeError(
+                    "Camera conditioning was provided to a block without a camera encoder"
+                )
+            if camera_B_T_H_W_C.shape[:4] != normalized_x_B_T_H_W_D.shape[:4]:
+                raise ValueError(
+                    "Camera and video token grids do not match: "
+                    f"{tuple(camera_B_T_H_W_C.shape[:4])} and "
+                    f"{tuple(normalized_x_B_T_H_W_D.shape[:4])}"
+                )
+            normalized_x_B_T_H_W_D = normalized_x_B_T_H_W_D + self.camera_encoder(
+                camera_B_T_H_W_C.to(dtype=normalized_x_B_T_H_W_D.dtype)
+            )
 
         video_size = VideoSize(T=T, H=H, W=W)
 
@@ -1597,6 +1613,53 @@ class MiniTrainDIT(WeightTrainingStat):
         if self.extra_image_context_dim is not None:
             self.img_context_proj[0].reset_parameters()
 
+    def enable_camera_conditioning(
+        self,
+        camera_dim: int,
+        init_seed: int = 0,
+    ) -> None:
+        """Attach an independent camera projection to every self-attention block."""
+        if camera_dim <= 0:
+            raise ValueError("camera_dim must be positive")
+        first_weight = self.blocks[0].self_attn.q_proj.weight
+        if first_weight.is_meta:
+            raise RuntimeError("Load the base Cosmos weights before adding camera encoders")
+        generator = torch.Generator(device=first_weight.device)
+        generator.manual_seed(init_seed)
+        std = 1.0 / math.sqrt(self.model_channels)
+
+        for block in self.blocks:
+            if block.camera_encoder is not None:
+                if block.camera_encoder.in_features != camera_dim:
+                    raise ValueError(
+                        "Camera conditioning is already enabled with a different dimension"
+                    )
+                continue
+            reference = block.self_attn.q_proj.weight
+            camera_encoder = nn.Linear(
+                camera_dim,
+                self.model_channels,
+                bias=False,
+                device=reference.device,
+                dtype=reference.dtype,
+            )
+            initialized = torch.empty(
+                camera_encoder.weight.shape,
+                device=reference.device,
+                dtype=torch.float32,
+            )
+            torch.nn.init.trunc_normal_(
+                initialized,
+                std=std,
+                a=-3 * std,
+                b=3 * std,
+                generator=generator,
+            )
+            with torch.no_grad():
+                camera_encoder.weight.copy_(initialized)
+            block.camera_encoder = camera_encoder
+        self.camera_condition_dim = camera_dim
+
     def build_patch_embed(self):
         (
             concat_padding_mask,
@@ -1723,6 +1786,7 @@ class MiniTrainDIT(WeightTrainingStat):
         data_type: Optional[DataType] = DataType.VIDEO,
         intermediate_feature_ids: Optional[List[int]] = None,
         img_context_emb: Optional[torch.Tensor] = None,
+        camera_condition_B_C_T_H_W: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Args:
@@ -1738,6 +1802,16 @@ class MiniTrainDIT(WeightTrainingStat):
             fps=fps,
             padding_mask=padding_mask,
         )
+        camera_B_T_H_W_C = None
+        if camera_condition_B_C_T_H_W is not None:
+            camera_B_T_H_W_C = camera_condition_B_C_T_H_W.permute(
+                0, 2, 3, 4, 1
+            ).contiguous()
+            if camera_B_T_H_W_C.shape[:4] != x_B_T_H_W_D.shape[:4]:
+                raise ValueError(
+                    "Camera conditioning does not match the embedded video grid: "
+                    f"{tuple(camera_B_T_H_W_C.shape)} versus {tuple(x_B_T_H_W_D.shape)}"
+                )
 
         if self.use_crossattn_projection:
             crossattn_emb = self.crossattn_proj(crossattn_emb)
@@ -1781,6 +1855,7 @@ class MiniTrainDIT(WeightTrainingStat):
                 rope_emb_L_1_1_D=rope_emb_L_1_1_D,
                 adaln_lora_B_T_3D=adaln_lora_B_T_3D,
                 extra_per_block_pos_emb=extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
+                camera_B_T_H_W_C=camera_B_T_H_W_C,
             )
             if intermediate_feature_ids and i in intermediate_feature_ids:
                 x_reshaped_for_disc = rearrange(x_B_T_H_W_D, "b tp hp wp d -> b (tp hp wp) d")

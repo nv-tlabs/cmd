@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Self-Forcing Authors. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # SPDX-FileCopyrightText: Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaOneWayNoncommercial
 
@@ -18,6 +33,8 @@ import torch
 import wandb
 import time
 import os
+
+from cosmos.camera_conditioning import build_camera_conditioning
 
 
 class Trainer:
@@ -126,7 +143,13 @@ class Trainer:
 
         # Step 3: Initialize the dataloader
         if self.config.i2v:
-            dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
+            dataset = ShardingLMDBDataset(
+                config.data_path,
+                max_pair=int(1e8),
+                load_camera=bool(
+                    getattr(config, "camera_conditioning", False)
+                ),
+            )
         else:
             dataset = TextDataset(config.data_path)
         sampler = torch.utils.data.distributed.DistributedSampler(
@@ -205,6 +228,9 @@ class Trainer:
 
         self.max_grad_norm_generator = getattr(config, "max_grad_norm_generator", 10.0)
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
+        self.grad_accum_iter = int(getattr(config, "grad_accum_iter", 1))
+        if self.grad_accum_iter <= 0:
+            raise ValueError("grad_accum_iter must be positive")
         self.previous_time = None
 
     def save(self):
@@ -234,7 +260,7 @@ class Trainer:
             print("Model saved to", os.path.join(self.output_path,
                   f"checkpoint_model_{self.step:06d}", "model.pt"))
 
-    def fwdbwd_one_step(self, batch, train_generator):
+    def fwdbwd_one_step(self, batch, train_generator, loss_scale=1.0):
         self.model.eval()  # prevent any randomness (e.g. dropout)
 
         if self.step % 20 == 0:
@@ -274,6 +300,35 @@ class Trainer:
                 conditional_dict["initial_latent"] = image_latent
                 unconditional_dict["initial_latent"] = image_latent
 
+            if getattr(self.config, "camera_conditioning", False):
+                if "camera_poses" not in batch or "camera_intrinsics" not in batch:
+                    raise RuntimeError(
+                        "Camera-conditioned distillation requires camera_poses "
+                        "and camera_intrinsics in every batch"
+                    )
+                camera_condition = build_camera_conditioning(
+                    batch["camera_poses"].to(
+                        device=self.device,
+                        dtype=torch.float32,
+                    ),
+                    batch["camera_intrinsics"].to(
+                        device=self.device,
+                        dtype=torch.float32,
+                    ),
+                    image_height=int(self.config.height),
+                    image_width=int(self.config.width),
+                    frame_stride=int(
+                        getattr(self.config, "camera_frame_stride", 4)
+                    ),
+                    patch_size=int(
+                        getattr(self.config, "camera_patch_size", 16)
+                    ),
+                    expected_latent_frames=image_or_video_shape[1],
+                    output_dtype=self.dtype,
+                )
+                conditional_dict["camera_condition"] = camera_condition
+                unconditional_dict["camera_condition"] = camera_condition
+
         # Step 3: Store gradients for the generator (if training the generator)
         if train_generator:
             generator_loss, generator_log_dict = self.model.generator_loss(
@@ -284,12 +339,11 @@ class Trainer:
                 initial_latent=image_latent if self.config.i2v else None
             )
 
-            generator_loss.backward()
-            generator_grad_norm = self.model.generator.clip_grad_norm_(
-                self.max_grad_norm_generator)
+            (generator_loss * loss_scale).backward()
 
-            generator_log_dict.update({"generator_loss": generator_loss,
-                                       "generator_grad_norm": generator_grad_norm})
+            generator_log_dict.update(
+                {"generator_loss": generator_loss.detach()}
+            )
 
             return generator_log_dict
         else:
@@ -304,12 +358,9 @@ class Trainer:
             initial_latent=image_latent if self.config.i2v else None
         )
 
-        critic_loss.backward()
-        critic_grad_norm = self.model.fake_score.clip_grad_norm_(
-            self.max_grad_norm_critic)
+        (critic_loss * loss_scale).backward()
 
-        critic_log_dict.update({"critic_loss": critic_loss,
-                                "critic_grad_norm": critic_grad_norm})
+        critic_log_dict.update({"critic_loss": critic_loss.detach()})
 
         return critic_log_dict
 
@@ -367,14 +418,24 @@ class Trainer:
             if TRAIN_GENERATOR:
                 self.generator_optimizer.zero_grad(set_to_none=True)
                 extras_list = []
-                batch = next(self.dataloader)
-                if validate_first_batch:
-                    self.validation_callback.run(self, batch)
-                    validate_first_batch = False
-                    validation_ran = True
-                extra = self.fwdbwd_one_step(batch, True)
-                extras_list.append(extra)
+                for _ in range(self.grad_accum_iter):
+                    batch = next(self.dataloader)
+                    if validate_first_batch:
+                        self.validation_callback.run(self, batch)
+                        validate_first_batch = False
+                        validation_ran = True
+                    extra = self.fwdbwd_one_step(
+                        batch,
+                        True,
+                        loss_scale=1.0 / self.grad_accum_iter,
+                    )
+                    extras_list.append(extra)
                 generator_log_dict = merge_dict_list(extras_list)
+                generator_log_dict["generator_grad_norm"] = (
+                    self.model.generator.clip_grad_norm_(
+                        self.max_grad_norm_generator
+                    )
+                )
                 self.generator_optimizer.step()
                 if self.generator_ema is not None:
                     self.generator_ema.update(self.model.generator)
@@ -382,10 +443,20 @@ class Trainer:
             # Train the critic
             self.critic_optimizer.zero_grad(set_to_none=True)
             extras_list = []
-            batch = next(self.dataloader)
-            extra = self.fwdbwd_one_step(batch, False)
-            extras_list.append(extra)
+            for _ in range(self.grad_accum_iter):
+                batch = next(self.dataloader)
+                extra = self.fwdbwd_one_step(
+                    batch,
+                    False,
+                    loss_scale=1.0 / self.grad_accum_iter,
+                )
+                extras_list.append(extra)
             critic_log_dict = merge_dict_list(extras_list)
+            critic_log_dict["critic_grad_norm"] = (
+                self.model.fake_score.clip_grad_norm_(
+                    self.max_grad_norm_critic
+                )
+            )
             self.critic_optimizer.step()
 
             # Increment the step since we finished gradient update

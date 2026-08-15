@@ -469,9 +469,16 @@ class CosmosDiffusionWrapper(torch.nn.Module):
         cache_start: Optional[int] = None,
         store_kv: Optional[bool] = None,
     ) -> torch.Tensor:
-        del crossattn_cache, concat_time_embeddings, clean_x, aug_t, cache_start
+        del crossattn_cache, concat_time_embeddings, cache_start
         if classify_mode:
             raise NotImplementedError("Cosmos GAN classifier branch is not integrated")
+        teacher_forcing = clean_x is not None or aug_t is not None
+        if teacher_forcing and (clean_x is None or aug_t is None):
+            raise ValueError("Teacher forcing requires both clean_x and aug_t")
+        if teacher_forcing and (not self.is_causal or kv_cache is not None):
+            raise ValueError(
+                "Teacher forcing requires a causal model without a streaming KV cache"
+            )
 
         prompt_embeds = conditional_dict["prompt_embeds"]
         if self.uniform_timestep:
@@ -486,6 +493,21 @@ class CosmosDiffusionWrapper(torch.nn.Module):
                 kv_cache is None or int(current_start or 0) == 0
             ),
         )
+        clean_model_input = None
+        clean_input_timestep = None
+        if teacher_forcing:
+            clean_model_input, clean_input_timestep, clean_condition_mask = (
+                self._condition_inputs(
+                    clean_x,
+                    conditional_dict,
+                    aug_t,
+                    apply_initial_condition=True,
+                )
+            )
+            if clean_condition_mask.shape != condition_mask.shape:
+                raise ValueError(
+                    "Clean and noisy condition masks must have matching shapes"
+                )
         camera_condition = self._camera_condition(
             conditional_dict,
             model_input,
@@ -496,6 +518,11 @@ class CosmosDiffusionWrapper(torch.nn.Module):
         # DiT boundary just like a mixed-precision root module would.
         compute_dtype = self.model.x_embedder.proj[1].weight.dtype
         model_input_bcthw = model_input.to(dtype=compute_dtype).permute(0, 2, 1, 3, 4)
+        clean_model_input_bcthw = (
+            clean_model_input.to(dtype=compute_dtype).permute(0, 2, 1, 3, 4)
+            if clean_model_input is not None
+            else None
+        )
         prompt_embeds = prompt_embeds.to(dtype=compute_dtype)
         condition_mask = condition_mask.to(dtype=compute_dtype)
         if camera_condition is not None:
@@ -548,6 +575,17 @@ class CosmosDiffusionWrapper(torch.nn.Module):
                     store_kv=should_store_kv,
                     current_idx=frame_index,
                 ),
+            ).permute(0, 2, 1, 3, 4)
+        elif teacher_forcing:
+            flow_pred = self.model.forward_teacher_forcing(
+                noisy_x_B_C_T_H_W=model_input_bcthw,
+                clean_x_B_C_T_H_W=clean_model_input_bcthw,
+                noisy_timesteps_B_T=input_timestep,
+                clean_timesteps_B_T=clean_input_timestep,
+                crossattn_emb=prompt_embeds,
+                padding_mask=padding_mask,
+                condition_video_input_mask_B_C_T_H_W=condition_mask,
+                camera_condition_B_C_T_H_W=camera_condition,
             ).permute(0, 2, 1, 3, 4)
         else:
             flow_pred = self.model(

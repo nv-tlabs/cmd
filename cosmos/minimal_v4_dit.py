@@ -465,6 +465,9 @@ class Attention(nn.Module):
 
         self.output_proj = nn.Linear(inner_dim, query_dim, bias=False)
         self.output_dropout = nn.Dropout(dropout) if dropout > 1e-4 else nn.Identity()
+        # Camera-control checkpoints store the projection under each
+        # self-attention module as `self_attn.cam_encoder`.
+        self.cam_encoder = None
 
         if self.backend == "transformer_engine":
             self.attn_op = DotProductAttention(
@@ -548,12 +551,14 @@ class Attention(nn.Module):
         v,
         video_size: Optional[VideoSize] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
+        teacher_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         additional_args = {}
         if isinstance(self.attn_op, (NattenA2AAttnOp, NeighborhoodAttention)) or self.backend == "i4":
             additional_args["video_size"] = video_size
         if isinstance(self.attn_op, AttentionOpWithKVCache):
             additional_args["kv_cache_cfg"] = kv_cache_cfg
+            additional_args["teacher_kv"] = teacher_kv
 
         result = self.attn_op(q, k, v, **additional_args)  # [B, S, H, D]
         return self.output_dropout(self.output_proj(result))
@@ -565,6 +570,8 @@ class Attention(nn.Module):
         rope_emb: Optional[torch.Tensor] = None,
         video_size: Optional[VideoSize] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
+        teacher_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        return_kv: bool = False,
     ):
         """
         Args:
@@ -574,7 +581,17 @@ class Attention(nn.Module):
             video_size(VideoSize): Shape [T, H, W]
         """
         q, k, v = self.compute_qkv(x, context, rope_emb=rope_emb)
-        return self.compute_attention(q, k, v, video_size=video_size, kv_cache_cfg=kv_cache_cfg)
+        result = self.compute_attention(
+            q,
+            k,
+            v,
+            video_size=video_size,
+            kv_cache_cfg=kv_cache_cfg,
+            teacher_kv=teacher_kv,
+        )
+        if return_kv:
+            return result, (k.detach(), v.detach())
+        return result
 
     def set_context_parallel_group(self, process_group, ranks, stream, cp_comm_type: str = "p2p"):
         # self.attn_op.set_context_parallel_group(process_group, ranks, stream, cp_comm_type="a2a")
@@ -1179,8 +1196,6 @@ class Block(nn.Module):
             backend=backend,
             use_wan_fp32_strategy=use_wan_fp32_strategy,
         )
-        self.camera_encoder = None
-
         self.layer_norm_cross_attn = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
 
         if image_context_dim is None:
@@ -1269,7 +1284,39 @@ class Block(nn.Module):
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
         camera_B_T_H_W_C: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        teacher_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        return_self_attn_kv: bool = False,
+    ) -> torch.Tensor | tuple[
+        torch.Tensor, tuple[torch.Tensor, torch.Tensor]
+    ]:
+        return self._forward_single(
+            x_B_T_H_W_D,
+            emb_B_T_D,
+            crossattn_emb,
+            rope_emb_L_1_1_D=rope_emb_L_1_1_D,
+            adaln_lora_B_T_3D=adaln_lora_B_T_3D,
+            extra_per_block_pos_emb=extra_per_block_pos_emb,
+            kv_cache_cfg=kv_cache_cfg,
+            camera_B_T_H_W_C=camera_B_T_H_W_C,
+            teacher_kv=teacher_kv,
+            return_self_attn_kv=return_self_attn_kv,
+        )
+
+    def _forward_single(
+        self,
+        x_B_T_H_W_D: torch.Tensor,
+        emb_B_T_D: torch.Tensor,
+        crossattn_emb: torch.Tensor,
+        rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
+        adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
+        extra_per_block_pos_emb: Optional[torch.Tensor] = None,
+        kv_cache_cfg: Optional[KVCacheConfig] = None,
+        camera_B_T_H_W_C: Optional[torch.Tensor] = None,
+        teacher_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        return_self_attn_kv: bool = False,
+    ) -> torch.Tensor | tuple[
+        torch.Tensor, tuple[torch.Tensor, torch.Tensor]
+    ]:
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
 
@@ -1318,7 +1365,7 @@ class Block(nn.Module):
             shift_self_attn_B_T_1_1_D,
         )
         if camera_B_T_H_W_C is not None:
-            if self.camera_encoder is None:
+            if self.self_attn.cam_encoder is None:
                 raise RuntimeError(
                     "Camera conditioning was provided to a block without a camera encoder"
                 )
@@ -1328,7 +1375,7 @@ class Block(nn.Module):
                     f"{tuple(camera_B_T_H_W_C.shape[:4])} and "
                     f"{tuple(normalized_x_B_T_H_W_D.shape[:4])}"
                 )
-            normalized_x_B_T_H_W_D = normalized_x_B_T_H_W_D + self.camera_encoder(
+            normalized_x_B_T_H_W_D = normalized_x_B_T_H_W_D + self.self_attn.cam_encoder(
                 camera_B_T_H_W_C.to(dtype=normalized_x_B_T_H_W_D.dtype)
             )
 
@@ -1342,15 +1389,19 @@ class Block(nn.Module):
         if self.cp_size is not None and self.cp_size > 1:
             video_size = VideoSize(T=T * self.cp_size, H=H, W=W)
 
+        self_attn_result = self.self_attn(
+            rearrange(normalized_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
+            None,
+            rope_emb=rope_emb_L_1_1_D,
+            video_size=video_size,
+            kv_cache_cfg=kv_cache_cfg,
+            teacher_kv=teacher_kv,
+            return_kv=return_self_attn_kv,
+        )
+        if return_self_attn_kv:
+            self_attn_result, projected_kv = self_attn_result
         result_B_T_H_W_D = rearrange(
-            self.self_attn(
-                # normalized_x_B_T_HW_D,
-                rearrange(normalized_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
-                None,
-                rope_emb=rope_emb_L_1_1_D,
-                video_size=video_size,
-                kv_cache_cfg=kv_cache_cfg,
-            ),
+            self_attn_result,
             "b (t h w) d -> b t h w d",
             t=T,
             h=H,
@@ -1399,6 +1450,8 @@ class Block(nn.Module):
         )
         result_B_T_H_W_D = self.mlp(normalized_x_B_T_H_W_D)
         x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp_B_T_1_1_D * result_B_T_H_W_D
+        if return_self_attn_kv:
+            return x_B_T_H_W_D, projected_kv
         return x_B_T_H_W_D
 
 
@@ -1618,7 +1671,7 @@ class MiniTrainDIT(WeightTrainingStat):
         camera_dim: int,
         init_seed: int = 0,
     ) -> None:
-        """Attach an independent camera projection to every self-attention block."""
+        """Attach the checkpoint-compatible camera projection to each self-attention."""
         if camera_dim <= 0:
             raise ValueError("camera_dim must be positive")
         first_weight = self.blocks[0].self_attn.q_proj.weight
@@ -1629,8 +1682,8 @@ class MiniTrainDIT(WeightTrainingStat):
         std = 1.0 / math.sqrt(self.model_channels)
 
         for block in self.blocks:
-            if block.camera_encoder is not None:
-                if block.camera_encoder.in_features != camera_dim:
+            if block.self_attn.cam_encoder is not None:
+                if block.self_attn.cam_encoder.in_features != camera_dim:
                     raise ValueError(
                         "Camera conditioning is already enabled with a different dimension"
                     )
@@ -1657,7 +1710,7 @@ class MiniTrainDIT(WeightTrainingStat):
             )
             with torch.no_grad():
                 camera_encoder.weight.copy_(initialized)
-            block.camera_encoder = camera_encoder
+            block.self_attn.cam_encoder = camera_encoder
         self.camera_condition_dim = camera_dim
 
     def build_patch_embed(self):

@@ -12,8 +12,8 @@ import re
 import tempfile
 from pathlib import Path
 
+import av
 import numpy as np
-from PIL import Image
 from tqdm import tqdm
 
 
@@ -47,7 +47,7 @@ def parse_args():
     parser.add_argument(
         "--input-dir",
         type=Path,
-        default=Path("data/dl3dv_1k_480p/1K"),
+        default=Path("data/dl3dv_1k_videos/1K"),
     )
     parser.add_argument(
         "--output",
@@ -59,7 +59,6 @@ def parse_args():
         default="Qwen/Qwen3-VL-8B-Instruct",
     )
     parser.add_argument("--num-frames", type=int, default=93)
-    parser.add_argument("--clip-stride", type=int, default=93)
     parser.add_argument("--caption-frames", type=int, default=16)
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument(
@@ -138,43 +137,51 @@ def load_captions(path):
     return captions
 
 
-def all_clips(input_dir, num_frames, clip_stride, max_clips=None):
+def all_clips(input_dir, num_frames, max_clips=None):
     clips = []
     for scene_dir in sorted(path for path in input_dir.iterdir() if path.is_dir()):
-        image_dir = scene_dir / "images_8"
-        transforms_path = scene_dir / "transforms.json"
-        if not image_dir.is_dir() or not transforms_path.is_file():
+        video_path = scene_dir / "video.mp4"
+        if not video_path.is_file():
             continue
-        metadata = json.loads(transforms_path.read_text(encoding="utf-8"))
-        posed_frames = {
-            Path(frame["file_path"]).name for frame in metadata["frames"]
-        }
-        image_paths = sorted(
-            path
-            for path in image_dir.iterdir()
-            if path.suffix.lower() in {".jpg", ".jpeg", ".png"}
-            and path.name in posed_frames
+        indices = np.arange(1, num_frames + 1, dtype=np.int32)
+        clips.append(
+            (clip_key(scene_dir.name, indices), video_path)
         )
-        for start in range(0, len(image_paths) - num_frames + 1, clip_stride):
-            paths = image_paths[start : start + num_frames]
-            indices = [int(path.stem.rsplit("_", 1)[-1]) for path in paths]
-            clips.append((clip_key(scene_dir.name, indices), paths))
-            if max_clips is not None and len(clips) >= max_clips:
-                return clips
+        if max_clips is not None and len(clips) >= max_clips:
+            return clips
     return clips
 
 
-def sampled_images(paths, count):
-    positions = np.linspace(0, len(paths) - 1, min(count, len(paths)), dtype=int)
+def sampled_images(video_path, count, num_frames):
+    positions = set(
+        np.linspace(0, num_frames - 1, min(count, num_frames), dtype=int)
+    )
     images = []
-    for position in positions:
-        with Image.open(paths[position]) as image:
-            images.append(image.convert("RGB").copy())
+    with av.open(str(video_path)) as container:
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        for index, frame in enumerate(container.decode(stream)):
+            if index in positions:
+                images.append(frame.to_image().convert("RGB"))
+            if index == num_frames - 1:
+                break
+    if len(images) != len(positions):
+        raise ValueError(
+            f"{video_path} has fewer than {num_frames} decoded frames"
+        )
     return images
 
 
-def caption_clip(model, processor, device, paths, count, max_new_tokens):
-    images = sampled_images(paths, count)
+def caption_clip(
+    model,
+    processor,
+    device,
+    video_path,
+    count,
+    num_frames,
+    max_new_tokens,
+):
+    images = sampled_images(video_path, count, num_frames)
     messages = [
         {
             "role": "user",
@@ -250,8 +257,8 @@ def main():
         raise FileNotFoundError(args.input_dir)
     if args.num_workers <= 0 or not 0 <= args.worker_id < args.num_workers:
         raise ValueError("Invalid worker ID/count")
-    if args.caption_frames <= 0 or args.num_frames <= 0 or args.clip_stride <= 0:
-        raise ValueError("Frame counts and stride must be positive")
+    if args.caption_frames <= 0 or args.num_frames <= 0:
+        raise ValueError("Frame counts must be positive")
 
     print(
         f"[caption worker {args.worker_id}/{args.num_workers}] scanning clips",
@@ -260,7 +267,6 @@ def main():
     clips = all_clips(
         args.input_dir,
         args.num_frames,
-        args.clip_stride,
         args.max_clips,
     )
     captions = load_captions(args.output)
@@ -275,8 +281,8 @@ def main():
         return
 
     owned = [
-        (index, key, paths)
-        for index, (key, paths) in enumerate(clips)
+        (index, key, video_path)
+        for index, (key, video_path) in enumerate(clips)
         if index % args.num_workers == args.worker_id and key not in captions
     ]
     if not owned:
@@ -312,7 +318,7 @@ def main():
     )
     lock_path = args.output.with_suffix(args.output.suffix + ".lock")
 
-    for _, key, paths in tqdm(
+    for _, key, video_path in tqdm(
         owned,
         desc=f"Qwen captions {args.worker_id}/{args.num_workers}",
     ):
@@ -321,8 +327,9 @@ def main():
                 model,
                 processor,
                 device,
-                paths,
+                video_path,
                 args.caption_frames,
+                args.num_frames,
                 args.max_new_tokens,
             )
         store_caption(args.output, lock_path, key, caption)

@@ -21,7 +21,15 @@ import logging
 
 from utils.dataset import ShardingLMDBDataset, cycle
 from utils.dataset import TextDataset
-from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
+from utils.distributed import (
+    EMA_FSDP,
+    create_fsdp2_device_mesh,
+    distributed_clip_grad_norm_,
+    fsdp2_wrap_cosmos_score,
+    fsdp_state_dict,
+    fsdp_wrap,
+    launch_distributed_job,
+)
 from utils.misc import (
     set_seed,
     merge_dict_list
@@ -35,6 +43,121 @@ import time
 import os
 
 from cosmos.camera_conditioning import build_camera_conditioning
+
+
+def load_checkpoint(path):
+    if str(path).endswith(".safetensors"):
+        from safetensors.torch import load_file
+
+        return load_file(path, device="cpu")
+    return torch.load(path, map_location="cpu")
+
+
+def save_safetensors_checkpoint(state_dict, path, *, component, step):
+    """Save one flat model component without pickle serialization."""
+    from safetensors.torch import save_file
+
+    tensors = {}
+    for name, value in state_dict.items():
+        if not torch.is_tensor(value):
+            raise TypeError(
+                f"Safetensors checkpoint entry {name!r} is not a tensor: "
+                f"{type(value).__name__}"
+            )
+        tensors[name] = value.detach().cpu().contiguous()
+
+    save_file(
+        tensors,
+        path,
+        metadata={
+            "component": component,
+            "step": str(step),
+        },
+    )
+
+
+_COSMOS_CHECKPOINT_OPTIONAL_BUFFERS = {
+    "model.accum_video_sample_counter",
+    "model.accum_image_sample_counter",
+    "model.accum_iteration",
+    "model.accum_train_in_hours",
+}
+
+
+def load_model_state_dict(module, state_dict, model_family, description):
+    """Load exported Cosmos DiT weights into the diffusion-wrapper FSDP module."""
+    if model_family != "cosmos":
+        module.load_state_dict(state_dict, strict=True)
+        return
+
+    # Exported Cosmos safetensors contain bare DiT names (`blocks.*`), while
+    # the training object is a diffusion wrapper whose DiT is named `model`.
+    normalized = {}
+    for name, value in state_dict.items():
+        normalized_name = name if name.startswith("model.") else f"model.{name}"
+        if normalized_name in normalized:
+            raise RuntimeError(
+                f"Duplicate key after Cosmos checkpoint normalization: {normalized_name}"
+            )
+        normalized[normalized_name] = value
+
+    incompatible = module.load_state_dict(normalized, strict=False)
+    missing = set(incompatible.missing_keys)
+    unexpected = set(incompatible.unexpected_keys)
+    invalid_missing = missing - _COSMOS_CHECKPOINT_OPTIONAL_BUFFERS
+    if invalid_missing or unexpected:
+        raise RuntimeError(
+            f"Incompatible {description} Cosmos checkpoint after key normalization: "
+            f"missing={sorted(invalid_missing)}, unexpected={sorted(unexpected)}"
+        )
+    if dist.get_rank() == 0:
+        print(
+            f"Loaded {description}: {len(normalized)} tensors; "
+            f"kept {len(missing)} runtime bookkeeping buffers",
+            flush=True,
+        )
+
+
+def load_pretrained_components(model, config):
+    """Load the configured generator and score checkpoints."""
+    state_dict = None
+    loaded_checkpoint = None
+    if getattr(config, "generator_ckpt", False):
+        print(f"Loading pretrained generator from {config.generator_ckpt}")
+        state_dict = load_checkpoint(config.generator_ckpt)
+        if "generator" in state_dict:
+            state_dict = state_dict["generator"]
+        elif "model" in state_dict:
+            state_dict = state_dict["model"]
+        load_model_state_dict(
+            model.generator,
+            state_dict,
+            getattr(config, "model_family", "wan"),
+            "generator",
+        )
+        loaded_checkpoint = config.generator_ckpt
+
+    if getattr(config, "teacher_ckpt", False):
+        if config.teacher_ckpt != loaded_checkpoint:
+            state_dict = load_checkpoint(config.teacher_ckpt)
+            if "generator" in state_dict:
+                state_dict = state_dict["generator"]
+            elif "model" in state_dict:
+                state_dict = state_dict["model"]
+        print(f"Loading causal real and fake scores from {config.teacher_ckpt}")
+        model_family = getattr(config, "model_family", "wan")
+        load_model_state_dict(
+            model.real_score,
+            state_dict,
+            model_family,
+            "real score",
+        )
+        load_model_state_dict(
+            model.fake_score,
+            state_dict,
+            model_family,
+            "fake score",
+        )
 
 
 class Trainer:
@@ -89,8 +212,14 @@ class Trainer:
         else:
             raise ValueError("Invalid distribution matching loss")
 
-        # Save pretrained model state_dicts to CPU
-        self.fake_score_state_dict_cpu = self.model.fake_score.state_dict()
+        use_fsdp2_scores = (
+            getattr(config, "model_family", "wan") == "cosmos"
+            and config.distribution_loss == "context_matched"
+        )
+        if use_fsdp2_scores:
+            # FSDP2 parameters become DTensors, so load ordinary full tensors
+            # before applying composable sharding.
+            load_pretrained_components(self.model, config)
 
         self.model.generator = fsdp_wrap(
             self.model.generator,
@@ -99,19 +228,37 @@ class Trainer:
             wrap_strategy=config.generator_fsdp_wrap_strategy
         )
 
-        self.model.real_score = fsdp_wrap(
-            self.model.real_score,
-            sharding_strategy=config.sharding_strategy,
-            mixed_precision=config.mixed_precision,
-            wrap_strategy=config.real_score_fsdp_wrap_strategy
-        )
+        if use_fsdp2_scores:
+            score_mesh = create_fsdp2_device_mesh()
+            self.model.real_score = fsdp2_wrap_cosmos_score(
+                self.model.real_score,
+                mesh=score_mesh,
+                mixed_precision=config.mixed_precision,
+            )
+            self.model.fake_score = fsdp2_wrap_cosmos_score(
+                self.model.fake_score,
+                mesh=score_mesh,
+                mixed_precision=config.mixed_precision,
+            )
+            if self.is_main_process:
+                print(
+                    "Using explicit block-sharded FSDP2 for Cosmos score models",
+                    flush=True,
+                )
+        else:
+            self.model.real_score = fsdp_wrap(
+                self.model.real_score,
+                sharding_strategy=config.sharding_strategy,
+                mixed_precision=config.mixed_precision,
+                wrap_strategy=config.real_score_fsdp_wrap_strategy
+            )
 
-        self.model.fake_score = fsdp_wrap(
-            self.model.fake_score,
-            sharding_strategy=config.sharding_strategy,
-            mixed_precision=config.mixed_precision,
-            wrap_strategy=config.fake_score_fsdp_wrap_strategy
-        )
+            self.model.fake_score = fsdp_wrap(
+                self.model.fake_score,
+                sharding_strategy=config.sharding_strategy,
+                mixed_precision=config.mixed_precision,
+                wrap_strategy=config.fake_score_fsdp_wrap_strategy
+            )
 
         self.model.text_encoder = fsdp_wrap(
             self.model.text_encoder,
@@ -120,6 +267,9 @@ class Trainer:
             wrap_strategy=config.text_encoder_fsdp_wrap_strategy,
             cpu_offload=getattr(config, "text_encoder_cpu_offload", False)
         )
+
+        if not use_fsdp2_scores:
+            load_pretrained_components(self.model, config)
 
         if not config.no_visualize or config.load_raw_video:
             self.model.vae = self.model.vae.to(
@@ -154,11 +304,16 @@ class Trainer:
             dataset = TextDataset(config.data_path)
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, shuffle=True, drop_last=True)
+        dataloader_num_workers = int(
+            getattr(config, "dataloader_num_workers", 8)
+        )
+        if dataloader_num_workers < 0:
+            raise ValueError("dataloader_num_workers must be non-negative")
         dataloader = torch.utils.data.DataLoader(
             dataset,
             batch_size=config.batch_size,
             sampler=sampler,
-            num_workers=8)
+            num_workers=dataloader_num_workers)
 
         if dist.get_rank() == 0:
             print("DATASET SIZE %d" % len(dataset))
@@ -192,36 +347,6 @@ class Trainer:
             print(f"Setting up EMA with weight {ema_weight}")
             self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
 
-        ##############################################################################################################
-        # 7. (If resuming) Load the model and optimizer, lr_scheduler, ema's statedicts
-        state_dict = None
-        loaded_checkpoint = None
-        if getattr(config, "generator_ckpt", False):
-            print(f"Loading pretrained generator from {config.generator_ckpt}")
-            state_dict = torch.load(config.generator_ckpt, map_location="cpu")
-            if "generator" in state_dict:
-                state_dict = state_dict["generator"]
-            elif "model" in state_dict:
-                state_dict = state_dict["model"]
-            self.model.generator.load_state_dict(
-                state_dict, strict=True
-            )
-            loaded_checkpoint = config.generator_ckpt
-
-        if getattr(config, "teacher_ckpt", False):
-            if config.teacher_ckpt != loaded_checkpoint:
-                state_dict = torch.load(config.teacher_ckpt, map_location="cpu")
-                if "generator" in state_dict:
-                    state_dict = state_dict["generator"]
-                elif "model" in state_dict:
-                    state_dict = state_dict["model"]
-            print(f"Loading causal real and fake scores from {config.teacher_ckpt}")
-            self.model.real_score.load_state_dict(state_dict, strict=True)
-            self.model.fake_score.load_state_dict(state_dict, strict=True)
-        del state_dict
-
-        ##############################################################################################################
-
         # Let's delete EMA params for early steps to save some computes at training and inference
         if self.step < config.ema_start_step:
             self.generator_ema = None
@@ -253,12 +378,27 @@ class Trainer:
             }
 
         if self.is_main_process:
-            os.makedirs(os.path.join(self.output_path,
-                        f"checkpoint_model_{self.step:06d}"), exist_ok=True)
-            torch.save(state_dict, os.path.join(self.output_path,
-                       f"checkpoint_model_{self.step:06d}", "model.pt"))
-            print("Model saved to", os.path.join(self.output_path,
-                  f"checkpoint_model_{self.step:06d}", "model.pt"))
+            checkpoint_dir = os.path.join(
+                self.output_path,
+                f"checkpoint_model_{self.step:06d}",
+            )
+            os.makedirs(checkpoint_dir, exist_ok=True)
+
+            training_checkpoint_path = os.path.join(checkpoint_dir, "model.pt")
+            torch.save(state_dict, training_checkpoint_path)
+
+            generator_path = os.path.join(checkpoint_dir, "model.safetensors")
+            save_safetensors_checkpoint(
+                generator_state_dict,
+                generator_path,
+                component="generator",
+                step=self.step,
+            )
+            print(
+                "Training checkpoint and generator safetensors saved to",
+                training_checkpoint_path,
+                generator_path,
+            )
 
     def fwdbwd_one_step(self, batch, train_generator, loss_scale=1.0):
         self.model.eval()  # prevent any randomness (e.g. dropout)
@@ -413,9 +553,15 @@ class Trainer:
         while max_steps is None or self.step < max_steps:
             validation_ran = False
             TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
+            first_iteration = self.step == start_step
 
             # Train the generator
             if TRAIN_GENERATOR:
+                if self.is_main_process and first_iteration:
+                    print(
+                        f"Starting generator forward/backward at step {self.step}",
+                        flush=True,
+                    )
                 self.generator_optimizer.zero_grad(set_to_none=True)
                 extras_list = []
                 for _ in range(self.grad_accum_iter):
@@ -432,15 +578,26 @@ class Trainer:
                     extras_list.append(extra)
                 generator_log_dict = merge_dict_list(extras_list)
                 generator_log_dict["generator_grad_norm"] = (
-                    self.model.generator.clip_grad_norm_(
+                    distributed_clip_grad_norm_(
+                        self.model.generator,
                         self.max_grad_norm_generator
                     )
                 )
                 self.generator_optimizer.step()
                 if self.generator_ema is not None:
                     self.generator_ema.update(self.model.generator)
+                if self.is_main_process and first_iteration:
+                    print(
+                        f"Finished generator update at step {self.step}",
+                        flush=True,
+                    )
 
             # Train the critic
+            if self.is_main_process and first_iteration:
+                print(
+                    f"Starting critic forward/backward at step {self.step}",
+                    flush=True,
+                )
             self.critic_optimizer.zero_grad(set_to_none=True)
             extras_list = []
             for _ in range(self.grad_accum_iter):
@@ -453,7 +610,8 @@ class Trainer:
                 extras_list.append(extra)
             critic_log_dict = merge_dict_list(extras_list)
             critic_log_dict["critic_grad_norm"] = (
-                self.model.fake_score.clip_grad_norm_(
+                distributed_clip_grad_norm_(
+                    self.model.fake_score,
                     self.max_grad_norm_critic
                 )
             )
@@ -461,6 +619,8 @@ class Trainer:
 
             # Increment the step since we finished gradient update
             self.step += 1
+            if self.is_main_process and first_iteration:
+                print(f"Finished training step {self.step}", flush=True)
 
             # Create EMA params (if not already created)
             if (self.step >= self.config.ema_start_step) and \

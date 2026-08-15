@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# SPDX-FileCopyrightText: Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaOneWayNoncommercial
+
 from datetime import timedelta
 from functools import partial
 import os
@@ -24,6 +27,20 @@ from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer
 
 
 def fsdp_state_dict(model):
+    if getattr(model, "_self_forcing_uses_fsdp2", False):
+        from torch.distributed.checkpoint.state_dict import (
+            StateDictOptions,
+            get_model_state_dict,
+        )
+
+        return get_model_state_dict(
+            model,
+            options=StateDictOptions(
+                full_state_dict=True,
+                cpu_offload=True,
+            ),
+        )
+
     fsdp_fullstate_save_policy = FullStateDictConfig(
         offload_to_cpu=True, rank0_only=True
     )
@@ -33,6 +50,138 @@ def fsdp_state_dict(model):
         checkpoint = model.state_dict()
 
     return checkpoint
+
+
+def create_fsdp2_device_mesh():
+    """Create the one-dimensional world mesh used by FSDP2 score models."""
+    if not dist.is_initialized():
+        raise RuntimeError("FSDP2 requires an initialized process group")
+
+    from torch.distributed.device_mesh import init_device_mesh
+
+    return init_device_mesh(
+        "cuda",
+        (dist.get_world_size(),),
+        mesh_dim_names=("fsdp",),
+    )
+
+
+def fsdp2_wrap_cosmos_score(module, mesh, mixed_precision=False):
+    """Shard a Cosmos score wrapper at explicit transformer boundaries.
+
+    The two-pass teacher-forcing forward invokes every transformer block once
+    for clean context and once for noisy inputs.  Re-sharding every block after
+    each call makes those repeated calls follow FSDP2's normal module lifecycle
+    instead of retaining FSDP1 all-gather state across the two passes.
+    """
+    from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+
+    if not hasattr(module, "model") or not hasattr(module.model, "blocks"):
+        raise TypeError("Expected a Cosmos diffusion wrapper with model.blocks")
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    module.to(device=device)
+
+    if mixed_precision:
+        child_mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            cast_forward_inputs=False,
+        )
+        root_mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            cast_forward_inputs=True,
+        )
+    else:
+        child_mp_policy = MixedPrecisionPolicy()
+        root_mp_policy = MixedPrecisionPolicy()
+
+    for block in module.model.blocks:
+        fully_shard(
+            block,
+            mesh=mesh,
+            reshard_after_forward=True,
+            mp_policy=child_mp_policy,
+        )
+
+    # These modules own parameters outside the transformer block stack and are
+    # called through their regular Module.forward entry points.
+    child_names = ["final_layer", "t_embedder", "x_embedder"]
+    if getattr(module.model, "extra_per_block_abs_pos_emb", False):
+        child_names.append("extra_pos_embedder")
+    if getattr(module.model, "extra_image_context_dim", None) is not None:
+        child_names.append("img_context_proj")
+    for child_name in child_names:
+        child = getattr(module.model, child_name, None)
+        if child is not None:
+            fully_shard(
+                child,
+                mesh=mesh,
+                reshard_after_forward=True,
+                mp_policy=child_mp_policy,
+            )
+
+    fully_shard(
+        module,
+        mesh=mesh,
+        reshard_after_forward=True,
+        mp_policy=root_mp_policy,
+    )
+    module._self_forcing_uses_fsdp2 = True
+    module._self_forcing_fsdp2_mesh = mesh
+    return module
+
+
+@torch.no_grad()
+def distributed_clip_grad_norm_(module, max_norm, norm_type=2.0):
+    """Clip gradients for either legacy FSDP or the FSDP2 score wrapper."""
+    if not getattr(module, "_self_forcing_uses_fsdp2", False):
+        return module.clip_grad_norm_(max_norm, norm_type=norm_type)
+    if float(norm_type) != 2.0:
+        raise NotImplementedError("The FSDP2 path currently supports L2 clipping only")
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    local_squared_norm = torch.zeros(
+        (),
+        device=device,
+        dtype=torch.float32,
+    )
+    local_gradients = []
+    rank = dist.get_rank()
+    for parameter in module.parameters():
+        gradient = parameter.grad
+        if gradient is None:
+            continue
+
+        if hasattr(gradient, "to_local") and hasattr(gradient, "placements"):
+            local_gradient = gradient.to_local()
+            placements = gradient.placements
+            is_replicated = all(
+                placement.__class__.__name__ == "Replicate"
+                for placement in placements
+            )
+        else:
+            local_gradient = gradient
+            is_replicated = True
+
+        local_gradients.append(local_gradient)
+        if not is_replicated or rank == 0:
+            local_squared_norm.add_(
+                local_gradient.detach().float().square().sum()
+            )
+
+    mesh = module._self_forcing_fsdp2_mesh
+    dist.all_reduce(local_squared_norm, op=dist.ReduceOp.SUM, group=mesh.get_group())
+    total_norm = local_squared_norm.sqrt()
+    clip_coefficient = torch.clamp(
+        torch.as_tensor(max_norm, device=total_norm.device, dtype=total_norm.dtype)
+        / (total_norm + 1e-6),
+        max=1.0,
+    )
+    for local_gradient in local_gradients:
+        local_gradient.mul_(clip_coefficient.to(dtype=local_gradient.dtype))
+    return total_norm
 
 
 def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_strategy="size", min_num_params=int(5e7), transformer_module=None, cpu_offload=False):

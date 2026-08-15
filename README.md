@@ -36,68 +36,68 @@ python setup.py develop
 
 ## Stage 1: Teacher Pretraining
 
-### Camera Conditioned Teacher Pretraining
+### Camera Teacher: t32/l21
 
-[`configs/cosmos/causal_flow_camera_finetune.yaml`](configs/cosmos/causal_flow_camera_finetune.yaml)
+[`configs/cosmos/t32_l21_camera_teacher_causal_flow.yaml`](configs/cosmos/t32_l21_camera_teacher_causal_flow.yaml)
 
 ```bash
 source scripts/setup_huggingface.sh
-export COSMOS_RUN_DIR="logs/dl3dv_camera_flow"
+export COSMOS_RUN_DIR="logs/t32_l21_camera_teacher"
 export WANDB_DIR="${COSMOS_RUN_DIR}/wandb"
 source scripts/setup_wandb.sh
 torchrun --standalone --nproc-per-node=8 \
   train.py \
-  --config_path configs/cosmos/causal_flow_camera_finetune.yaml \
+  --config_path configs/cosmos/t32_l21_camera_teacher_causal_flow.yaml \
   --logdir "${COSMOS_RUN_DIR}" \
   --wandb-save-dir "${WANDB_DIR}"
 ```
 
-### Short Video Teacher Pretraining
+### Non-Camera Teacher: t24/l21
 
-[`configs/cosmos/causal_flow_finetune.yaml`](configs/cosmos/causal_flow_finetune.yaml)
+[`configs/cosmos/t24_l21_teacher_causal_flow.yaml`](configs/cosmos/t24_l21_teacher_causal_flow.yaml)
 
 ```bash
 source scripts/setup_huggingface.sh
 
-export COSMOS_RUN_DIR="logs/dl3dv_causal_flow"
+export COSMOS_RUN_DIR="logs/t24_l21_teacher"
 export WANDB_DIR="${COSMOS_RUN_DIR}/wandb"
 source scripts/setup_wandb.sh
 
 torchrun --standalone --nproc-per-node=8 \
   train.py \
-  --config_path configs/cosmos/causal_flow_finetune.yaml \
+  --config_path configs/cosmos/t24_l21_teacher_causal_flow.yaml \
   --logdir "$COSMOS_RUN_DIR" \
   --wandb-save-dir "$WANDB_DIR"
 ```
 
 ## Stage 2: Context-Matched Distillation
 
-### Camera Conditioned Distillation
+### Camera Student Distillation: t32/l21
 
-[`configs/cosmos/camera_distillation.yaml`](configs/cosmos/camera_distillation.yaml)
+[`configs/cosmos/t32_l21_camera_student_distillation.yaml`](configs/cosmos/t32_l21_camera_student_distillation.yaml)
 
 ```bash
 source scripts/setup_huggingface.sh
 
-export COSMOS_RUN_DIR="logs/dl3dv_camera_distillation"
+export COSMOS_RUN_DIR="logs/t32_l21_camera_student_distillation"
 export WANDB_DIR="${COSMOS_RUN_DIR}/wandb"
 source scripts/setup_wandb.sh
 
 torchrun --standalone --nproc-per-node=8 \
   train.py \
-  --config_path configs/cosmos/camera_distillation.yaml \
+  --config_path configs/cosmos/t32_l21_camera_student_distillation.yaml \
   --logdir "${COSMOS_RUN_DIR}" \
   --wandb-save-dir "${WANDB_DIR}"
 ```
 
-### Short Video Distillation
+### Non-Camera Student Distillation: t24/l21
 
-[`configs/cosmos/context_matched_distillation.yaml`](configs/cosmos/context_matched_distillation.yaml)
+[`configs/cosmos/t24_l21_student_context_distillation.yaml`](configs/cosmos/t24_l21_student_context_distillation.yaml)
 
 ```bash
 source scripts/setup_huggingface.sh
 
-export COSMOS_RUN_DIR="logs/dl3dv_context_matched_distillation"
+export COSMOS_RUN_DIR="logs/t24_l21_student_context_distillation"
 export WANDB_DIR="${COSMOS_RUN_DIR}/wandb"
 export WANDB_JOB_TYPE="context-matched-distillation"
 export WANDB_TAGS="cosmos-predict2.5,2b,causal,i2v,context-matched-distillation,dl3dv-1k"
@@ -105,7 +105,7 @@ source scripts/setup_wandb.sh
 
 torchrun --standalone --nproc-per-node=8 \
   train.py \
-  --config_path configs/cosmos/context_matched_distillation.yaml \
+  --config_path configs/cosmos/t24_l21_student_context_distillation.yaml \
   --logdir "${COSMOS_RUN_DIR}" \
   --wandb-save-dir "${WANDB_DIR}"
 ```

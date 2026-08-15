@@ -134,7 +134,7 @@ class ContextMatchedDistillation(SelfForcingModel):
         conditional_dict: dict,
         noised_history: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Score each suffix frame from all preceding student frames as K/V."""
+        """Score the suffix in one full-sequence teacher-forcing model call."""
         if not self.context_matched_distillation:
             return score_model(
                 noisy_image_or_video=noisy_suffix,
@@ -168,65 +168,50 @@ class ContextMatchedDistillation(SelfForcingModel):
             device=timestep.device,
             dtype=timestep.dtype,
         )
-        kv_cache = score_model.initialize_kv_cache(
-            max_frames=1 + noised_history.shape[1] + 1,
-            batch_size=noisy_suffix.shape[0],
-            dtype=noisy_suffix.dtype,
-            device=noisy_suffix.device,
+        context_prefix = noised_history[:, :base_prefix_frames]
+        noisy_full = torch.cat(
+            [initial_latent, context_prefix, noisy_suffix],
+            dim=1,
         )
-        with torch.no_grad():
-            score_model(
-                noisy_image_or_video=initial_latent,
-                conditional_dict=conditional_dict,
-                timestep=torch.zeros_like(prefix_timestep),
-                kv_cache=kv_cache,
-                current_start=0,
-                store_kv=True,
-            )
-            for frame_index in range(base_prefix_frames):
-                score_model(
-                    noisy_image_or_video=noised_history[
-                        :, frame_index:frame_index + 1
-                    ],
-                    conditional_dict=conditional_dict,
-                    timestep=prefix_timestep,
-                    kv_cache=kv_cache,
-                    current_start=frame_index + 1,
-                    store_kv=True,
-                )
 
-        flow_predictions = []
-        x0_predictions = []
-        for suffix_index in range(suffix_frames):
-            current_start = 1 + base_prefix_frames + suffix_index
-            flow_pred, x0_pred = score_model(
-                noisy_image_or_video=noisy_suffix[
-                    :, suffix_index:suffix_index + 1
-                ],
-                conditional_dict=conditional_dict,
-                timestep=timestep[:, suffix_index:suffix_index + 1],
-                kv_cache=kv_cache,
-                current_start=current_start,
-                store_kv=False,
-            )
-            flow_predictions.append(flow_pred)
-            x0_predictions.append(x0_pred)
+        # Clean K/V is only visible to later blocks.  The final placeholder is
+        # therefore never consumed as clean context, but keeps both streams the
+        # same length so they share positions and block boundaries.
+        clean_placeholder = noisy_suffix[:, -1:].detach()
+        teacher_context = torch.cat(
+            [initial_latent, noised_history, clean_placeholder],
+            dim=1,
+        )
+        if teacher_context.shape != noisy_full.shape:
+            raise RuntimeError("Teacher-forcing streams have mismatched shapes")
 
-            if suffix_index + 1 < suffix_frames:
-                history_index = base_prefix_frames + suffix_index
-                with torch.no_grad():
-                    score_model(
-                        noisy_image_or_video=noised_history[
-                            :, history_index:history_index + 1
-                        ],
-                        conditional_dict=conditional_dict,
-                        timestep=prefix_timestep,
-                        kv_cache=kv_cache,
-                        current_start=current_start,
-                        store_kv=True,
-                    )
-
-        return torch.cat(flow_predictions, dim=1), torch.cat(x0_predictions, dim=1)
+        noisy_timestep = torch.cat(
+            [
+                torch.zeros_like(prefix_timestep),
+                prefix_timestep.expand(-1, base_prefix_frames),
+                timestep,
+            ],
+            dim=1,
+        )
+        teacher_timestep = torch.cat(
+            [
+                torch.zeros_like(prefix_timestep),
+                prefix_timestep.expand(-1, teacher_context.shape[1] - 1),
+            ],
+            dim=1,
+        )
+        flow_pred, x0_pred = score_model(
+            noisy_image_or_video=noisy_full,
+            conditional_dict=conditional_dict,
+            timestep=noisy_timestep,
+            clean_x=teacher_context,
+            aug_t=teacher_timestep,
+        )
+        suffix_start = 1 + base_prefix_frames
+        return (
+            flow_pred[:, suffix_start:],
+            x0_pred[:, suffix_start:],
+        )
 
     def _compute_kl_grad(
         self, noisy_image_or_video: torch.Tensor,

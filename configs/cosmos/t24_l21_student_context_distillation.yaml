@@ -1,7 +1,6 @@
-# Context-Matched Distillation initializes its student, frozen real score, and
-# trainable fake score from the causal-flow checkpoint.
-generator_ckpt: logs/dl3dv_causal_flow/checkpoint_model_000500/model.pt
-teacher_ckpt: logs/dl3dv_causal_flow/checkpoint_model_000500/model.pt
+# Stage 2: distill the t24/l21 student from the paired causal-flow teacher.
+generator_ckpt: checkpoints/chunk1_teacher_t24_l21.safetensors
+teacher_ckpt: checkpoints/chunk1_teacher_t24_l21.safetensors
 prefix_noise: 256
 model_family: cosmos
 real_name: nvidia/Cosmos-Predict2.5-2B
@@ -46,7 +45,7 @@ beta1_critic: 0.0
 beta2_critic: 0.999
 
 # Sharded LMDB containing prompts and Cosmos/Wan-VAE image latents.
-data_path: data/cosmos_i2v_lmdb
+data_path: data/cosmos_i2v_lmdb_t24
 batch_size: 1
 ema_weight: 0.0
 ema_start_step: 200

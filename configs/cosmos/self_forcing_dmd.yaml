@@ -40,7 +40,7 @@ beta2: 0.999
 beta1_critic: 0.0
 beta2_critic: 0.999
 
-data_path: data/cosmos_i2v_lmdb
+data_path: data/cosmos_i2v_lmdb_t24
 batch_size: 1
 ema_weight: 0.99
 ema_start_step: 200

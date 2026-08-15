@@ -1,4 +1,5 @@
-# T24 camera-conditioned causal flow matching on DL3DV.
+# Stage 1: train the t24/l21 causal-flow teacher from the bidirectional base.
+# Export it as checkpoints/chunk1_teacher_t24_l21.safetensors for Stage 2.
 model_family: cosmos
 text_encoder_name: nvidia/Cosmos-Reason1-7B
 vae_model_name: nvidia/Cosmos-Predict2.5-2B
@@ -18,7 +19,7 @@ sharding_strategy: hybrid_full
 mixed_precision: true
 gradient_checkpointing: true
 
-lr: 6.0e-5
+lr: 2.0e-5
 beta1: 0.0
 beta2: 0.999
 weight_decay: 0.01
@@ -26,24 +27,19 @@ max_grad_norm: 0.1
 batch_size: 1
 seed: 0
 
-data_path: data/cosmos_i2v_lmdb
+# Sharded LMDB with `prompts` and clean video latents in `latents`.
+data_path: data/cosmos_i2v_lmdb_t24
 load_raw_video: false
 image_or_video_shape: [1, 24, 16, 60, 104]
 i2v: true
 independent_first_frame: true
 num_frame_per_block: 1
-
-# Existing records contain 93 pixel-frame cameras. Stride four selects
-# frames 0, 4, ..., 92 for the 24 VAE latents. Camera translations are used
-# exactly as stored; this configuration applies no dataset-dependent scale.
-camera_conditioning: true
-camera_frame_stride: 4
-camera_patch_size: 16
+num_training_frames: 24
 
 ema_weight: 0.0
 ema_start_step: 0
-log_iters: 50
-max_steps: 100000
+log_iters: 500
+max_steps: 10000
 negative_prompt: >-
   The video captures a series of frames showing ugly scenes, static with no
   motion, motion blur, over-saturation, shaky footage, low resolution, grainy
@@ -60,6 +56,7 @@ validation_at_start: true
 validation_seed: 12345
 validation_fps: 16
 wandb_host: ${oc.env:WANDB_BASE_URL,https://api.wandb.ai}
+# wandb.login(key=None) reads WANDB_API_KEY without placing the key in config.
 wandb_key: null
 wandb_entity: ${oc.env:WANDB_ENTITY,null}
 wandb_project: ${oc.env:WANDB_PROJECT,causal-cosmos25}
@@ -70,6 +67,4 @@ model_kwargs:
   timestep_shift: 5.0
   i2v: true
   local_attn_size: 21
-  camera_conditioning: true
-  camera_patch_size: 16
-  camera_init_seed: 0
+  sink_size: 0

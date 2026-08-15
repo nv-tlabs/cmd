@@ -9,6 +9,9 @@ This NOTICE is informational and does not alter any applicable license.
 
 A copy of the Apache License, Version 2.0 is provided at
 LICENSES/Apache-2.0.txt.
+A copy of the NVIDIA OneWay Noncommercial License used by the
+LicenseRef-NvidiaOneWayNoncommercial SPDX identifier is provided at
+LICENSES/LicenseRef-NvidiaOneWayNoncommercial.txt.
 
 Wan2.1
 -------
@@ -51,8 +54,10 @@ Source: https://github.com/nvidia-cosmos/cosmos-predict2.5
 Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 License: Apache License 2.0
 Paths containing original or modified Cosmos-Predict2.5 code:
+  cosmos/causal_model.py
   cosmos/kv_cache.py
   cosmos/minimal_v1_lvg_dit.py
   cosmos/minimal_v4_dit.py
   cosmos/model_weights_stats.py
+  cosmos/runtime.py
   cosmos/selective_activation_checkpoint.py

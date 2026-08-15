@@ -18,6 +18,38 @@
 
 import argparse
 import os
+
+
+def _configure_distributed_compile_cache():
+    """Keep lazy CUDA compilation from serializing distributed ranks."""
+    local_rank = os.environ.get("LOCAL_RANK")
+    if local_rank is None:
+        return
+
+    shared_root = os.environ.get(
+        "SELF_FORCING_COMPILE_CACHE_ROOT",
+        os.path.join("/tmp", f"self_forcing_compile_{os.getuid()}"),
+    )
+    cache_root = os.path.join(
+        shared_root,
+        f"rank_{local_rank}",
+    )
+    # Override generic shared cache variables: sharing one compiler directory
+    # across local ranks is the failure mode this setup prevents.
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(
+        cache_root,
+        "inductor",
+    )
+    os.environ["TRITON_CACHE_DIR"] = os.path.join(cache_root, "triton")
+    # The Slurm step assigns one CPU to each rank. More compiler workers only
+    # contend for that CPU and amplify rank-to-rank compile skew.
+    os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+    if local_rank == "0":
+        print(f"Using rank-local compile caches under {shared_root}", flush=True)
+
+
+_configure_distributed_compile_cache()
+
 from omegaconf import OmegaConf
 import wandb
 

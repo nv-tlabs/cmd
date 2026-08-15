@@ -1,6 +1,6 @@
-# Camera-conditioned distillation initialized from the camera flow model.
-generator_ckpt: logs/dl3dv_camera_flow/checkpoint_model_000500/model.pt
-teacher_ckpt: logs/dl3dv_camera_flow/checkpoint_model_000500/model.pt
+# Stage 2: distill the camera-conditioned t32/l21 student from its teacher.
+generator_ckpt: checkpoints/chunk1_teacher_t32_l21_camera.safetensors
+teacher_ckpt: checkpoints/chunk1_teacher_t32_l21_camera.safetensors
 prefix_noise: 256
 model_family: cosmos
 real_name: nvidia/Cosmos-Predict2.5-2B
@@ -20,8 +20,8 @@ ts_schedule: false
 num_train_timestep: 1000
 timestep_shift: 5.0
 context_noise: 128
-validation_interval: 50
-validation_at_start: true
+validation_interval: 20
+validation_at_start: false
 validation_seed: 12345
 validation_fps: 16
 real_guidance_scale: 4.0
@@ -42,12 +42,13 @@ beta2: 0.999
 beta1_critic: 0.0
 beta2_critic: 0.999
 
-data_path: data/cosmos_i2v_lmdb
+data_path: data/cosmos_i2v_lmdb_t32_camera
 batch_size: 1
-grad_accum_iter: 2
+dataloader_num_workers: 1
+grad_accum_iter: 1
 ema_weight: 0.0
 ema_start_step: 200
-log_iters: 50
+log_iters: 100
 max_steps: 10000
 negative_prompt: >-
   The video captures a series of frames showing ugly scenes, static with no
@@ -60,7 +61,7 @@ negative_prompt: >-
   poor quality.
 dfake_gen_update_ratio: 5
 
-image_or_video_shape: [1, 24, 16, 60, 104]
+image_or_video_shape: [1, 32, 16, 60, 104]
 distribution_loss: context_matched
 trainer: score_distillation
 gradient_checkpointing: true
@@ -68,9 +69,9 @@ num_frame_per_block: 1
 load_raw_video: false
 i2v: true
 independent_first_frame: true
-num_training_frames: 24
+num_training_frames: 32
 
-# The 93 stored DL3DV cameras are used as-is; no translation scale is applied.
+# The 125 stored cameras map to 32 latents; translation is unscaled.
 camera_conditioning: true
 camera_frame_stride: 4
 camera_patch_size: 16

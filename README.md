@@ -47,20 +47,30 @@ python setup.py develop
 hf download nvidia/cmd --local-dir checkpoints
 ```
 
-## Dataset preparation
-
-[Dataset preparation instructions](DATASET.md)
-
-The DL3DV setup is provided only to verify that the training pipeline runs end
-to end. We do not release the training data used for the reported models.
-Reproducing the reported training quality requires a sufficiently large and
-diverse dataset; DL3DV alone is not sufficient.
-
 ## Inference
 
-The examples use the inputs in `examples/`, load checkpoints from `checkpoints/`,
-and write videos to `examples/outputs/`.
-The camera-conditioned example is taken from
+To generate a short video with the chunk-4 pipeline, run:
+
+```bash
+source scripts/setup_huggingface.sh
+
+python inference.py \
+  --config_path configs/cosmos/self_forcing_dmd.yaml \
+  --checkpoint_path checkpoints/chunk4_short_t21_l16.safetensors \
+  --image_path examples/image.png \
+  --prompt_path examples/prompt.txt \
+  --output_folder . \
+  --i2v \
+  --num_output_frames 21 \
+  --num_frame_per_block 4 \
+  --local_attn_size 16 \
+  --seed 22 \
+  --num_samples 1 \
+  --save_with_index
+```
+
+The scripts below run all trained variants using inputs from `examples/`. The
+camera-conditioned example is taken from
 [SANA-WM-Bench](https://huggingface.co/datasets/Efficient-Large-Model/SANA-WM-Bench).
 
 ```bash
@@ -77,6 +87,15 @@ bash examples/run_examples.sh chunk4-camera
 ```
 
 ## Training
+
+### Stage 0: Dataset preparation
+
+[Dataset preparation instructions](DATASET.md)
+
+The DL3DV setup is provided only to verify that the training pipeline runs end
+to end. We do not release the training data used for the reported models.
+Reproducing the reported training quality requires a sufficiently large and
+diverse dataset; DL3DV alone is not sufficient.
 
 ### Stage 1: Teacher pretraining
 

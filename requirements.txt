@@ -26,3 +26,4 @@ sentencepiece
 pydantic>=2.11.7
 scikit-image
 huggingface_hub[cli]
+safetensors>=0.4.5

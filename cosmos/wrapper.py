@@ -227,6 +227,16 @@ class CosmosDiffusionWrapper(torch.nn.Module):
             extra_one_step=True,
         )
         self.scheduler.set_timesteps(1000, training=True)
+        self.register_buffer(
+            "_flow_sigmas",
+            self.scheduler.sigmas.float(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_flow_timesteps",
+            self.scheduler.timesteps.float(),
+            persistent=False,
+        )
         self.post_init()
 
     @staticmethod
@@ -466,8 +476,9 @@ class CosmosDiffusionWrapper(torch.nn.Module):
         concat_time_embeddings: bool = False,
         clean_x: Optional[torch.Tensor] = None,
         aug_t: Optional[torch.Tensor] = None,
+        teacher_forcing_start: Optional[int] = None,
         cache_start: Optional[int] = None,
-        store_kv: Optional[bool] = None,
+        store_kv: bool = False,
     ) -> torch.Tensor:
         del crossattn_cache, concat_time_embeddings, cache_start
         if classify_mode:
@@ -475,6 +486,10 @@ class CosmosDiffusionWrapper(torch.nn.Module):
         teacher_forcing = clean_x is not None or aug_t is not None
         if teacher_forcing and (clean_x is None or aug_t is None):
             raise ValueError("Teacher forcing requires both clean_x and aug_t")
+        if teacher_forcing and teacher_forcing_start is None:
+            raise ValueError("Teacher forcing requires teacher_forcing_start")
+        if not teacher_forcing and teacher_forcing_start is not None:
+            raise ValueError("teacher_forcing_start requires teacher forcing")
         if teacher_forcing and (not self.is_causal or kv_cache is not None):
             raise ValueError(
                 "Teacher forcing requires a causal model without a streaming KV cache"
@@ -504,10 +519,6 @@ class CosmosDiffusionWrapper(torch.nn.Module):
                     apply_initial_condition=True,
                 )
             )
-            if clean_condition_mask.shape != condition_mask.shape:
-                raise ValueError(
-                    "Clean and noisy condition masks must have matching shapes"
-                )
         camera_condition = self._camera_condition(
             conditional_dict,
             model_input,
@@ -545,23 +556,27 @@ class CosmosDiffusionWrapper(torch.nn.Module):
                 VideoSeqPos,
             )
 
-            if model_input.shape[1] != 1:
-                raise ValueError(
-                    "Cosmos causal rollout uses one latent frame per block; "
-                    "set num_frame_per_block: 1"
-                )
             frame_index = int(current_start or 0)
+            frame_count = model_input.shape[1]
             token_h = model_input.shape[-2] // self.model.patch_spatial
             token_w = model_input.shape[-1] // self.model.patch_spatial
             video_pos = VideoSeqPos(
-                T=self._cache_max_frames,
+                T=frame_count,
                 H=token_h,
                 W=token_w,
-            ).frame(frame_index)
-            should_store_kv = (
-                bool(torch.all(input_timestep == 0).item())
-                if store_kv is None else bool(store_kv)
             )
+            video_pos.pos_t = video_pos.pos_t + frame_index
+            should_store_kv = bool(store_kv)
+            block_frames = int(getattr(self.model, "num_frame_per_block", 1))
+            if (
+                frame_count > 1
+                and not should_store_kv
+                and frame_count != block_frames
+            ):
+                raise ValueError(
+                    "Multi-frame causal input must match num_frame_per_block: "
+                    f"frames={frame_count}, block={block_frames}"
+                )
             flow_pred = self.model.forward_seq(
                 x_B_C_T_H_W=model_input_bcthw,
                 video_pos=video_pos,
@@ -570,6 +585,7 @@ class CosmosDiffusionWrapper(torch.nn.Module):
                 padding_mask=padding_mask,
                 condition_video_input_mask_B_C_T_H_W=condition_mask,
                 camera_condition_B_C_T_H_W=camera_condition,
+                full_video_size=(frame_index + frame_count, token_h, token_w),
                 kv_cache_cfg=KVCacheConfig(
                     run_with_kv=True,
                     store_kv=should_store_kv,
@@ -585,7 +601,9 @@ class CosmosDiffusionWrapper(torch.nn.Module):
                 crossattn_emb=prompt_embeds,
                 padding_mask=padding_mask,
                 condition_video_input_mask_B_C_T_H_W=condition_mask,
+                clean_condition_video_input_mask_B_C_T_H_W=clean_condition_mask,
                 camera_condition_B_C_T_H_W=camera_condition,
+                noisy_start_frame=int(teacher_forcing_start),
             ).permute(0, 2, 1, 3, 4)
         else:
             flow_pred = self.model(
@@ -611,15 +629,16 @@ class CosmosDiffusionWrapper(torch.nn.Module):
         timestep: torch.Tensor,
     ) -> torch.Tensor:
         original_dtype = flow_pred.dtype
-        flow_pred, xt, sigmas, timesteps = map(
-            lambda value: value.double().to(flow_pred.device),
-            [flow_pred, xt, self.scheduler.sigmas, self.scheduler.timesteps],
-        )
+        flow_pred = flow_pred.float()
+        xt = xt.float()
         timestep_id = torch.argmin(
-            (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(),
+            (
+                self._flow_timesteps.unsqueeze(0)
+                - timestep.float().unsqueeze(1)
+            ).abs(),
             dim=1,
         )
-        sigma_t = sigmas[timestep_id].reshape(-1, 1, 1, 1)
+        sigma_t = self._flow_sigmas[timestep_id].reshape(-1, 1, 1, 1)
         return (xt - sigma_t * flow_pred).to(original_dtype)
 
     @staticmethod
@@ -631,7 +650,7 @@ class CosmosDiffusionWrapper(torch.nn.Module):
     ) -> torch.Tensor:
         original_dtype = x0_pred.dtype
         x0_pred, xt, sigmas, timesteps = map(
-            lambda value: value.double().to(x0_pred.device),
+            lambda value: value.float().to(x0_pred.device),
             [x0_pred, xt, scheduler.sigmas, scheduler.timesteps],
         )
         timestep_id = torch.argmin(

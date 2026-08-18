@@ -18,7 +18,9 @@
   <a href="https://hmrishavbandy.github.io/cmd-site/">Project Page</a>
 </p>
 
-## Install
+## Setup
+
+### Installation
 
 ```bash
 conda create -n causal-cosmos python=3.10 -y
@@ -30,29 +32,46 @@ python setup.py develop
 
 [Cosmos-Predict2.5 2B access](https://huggingface.co/nvidia/Cosmos-Predict2.5-2B)
 
-## Dataset preparation
-
-[Instructions](DATASET.md)
-
-## Stage 1: Teacher Pretraining
-
-### Camera Teacher: t32/l21
-
-[`configs/cosmos/t32_l21_camera_teacher_causal_flow.yaml`](configs/cosmos/t32_l21_camera_teacher_causal_flow.yaml)
+### Checkpoints
 
 ```bash
-source scripts/setup_huggingface.sh
-export COSMOS_RUN_DIR="logs/t32_l21_camera_teacher"
-export WANDB_DIR="${COSMOS_RUN_DIR}/wandb"
-source scripts/setup_wandb.sh
-torchrun --standalone --nproc-per-node=8 \
-  train.py \
-  --config_path configs/cosmos/t32_l21_camera_teacher_causal_flow.yaml \
-  --logdir "${COSMOS_RUN_DIR}" \
-  --wandb-save-dir "${WANDB_DIR}"
+hf download nvidia/cmd --local-dir checkpoints
 ```
 
-### Non-Camera Teacher: t24/l21
+## Dataset preparation
+
+[Dataset preparation instructions](DATASET.md)
+
+The DL3DV setup is provided only to verify that the training pipeline runs end
+to end. We do not release the training data used for the reported models.
+Reproducing the reported training quality requires a sufficiently large and
+diverse dataset; DL3DV alone is not sufficient.
+
+## Inference
+
+The examples use the inputs in `examples/`, load checkpoints from `checkpoints/`,
+and write videos to `examples/outputs/`.
+The camera-conditioned example is taken from
+[SANA-WM-Bench](https://huggingface.co/datasets/Efficient-Large-Model/SANA-WM-Bench).
+
+```bash
+# Run all short, long, and camera-conditioned examples.
+bash examples/run_examples.sh
+
+# Run one example.
+bash examples/run_examples.sh chunk1-short
+bash examples/run_examples.sh chunk1-long
+bash examples/run_examples.sh chunk4-short
+bash examples/run_examples.sh chunk4-long
+bash examples/run_examples.sh chunk1-camera
+bash examples/run_examples.sh chunk4-camera
+```
+
+## Training
+
+### Stage 1: Teacher pretraining
+
+#### Non-camera teacher: T24 / L21
 
 [`configs/cosmos/t24_l21_teacher_causal_flow.yaml`](configs/cosmos/t24_l21_teacher_causal_flow.yaml)
 
@@ -70,27 +89,25 @@ torchrun --standalone --nproc-per-node=8 \
   --wandb-save-dir "$WANDB_DIR"
 ```
 
-## Stage 2: Context-Matched Distillation
+#### Camera teacher: T32 / L21
 
-### Camera Student Distillation: t32/l21
-
-[`configs/cosmos/t32_l21_camera_student_distillation.yaml`](configs/cosmos/t32_l21_camera_student_distillation.yaml)
+[`configs/cosmos/t32_l21_camera_teacher_causal_flow.yaml`](configs/cosmos/t32_l21_camera_teacher_causal_flow.yaml)
 
 ```bash
 source scripts/setup_huggingface.sh
-
-export COSMOS_RUN_DIR="logs/t32_l21_camera_student_distillation"
+export COSMOS_RUN_DIR="logs/t32_l21_camera_teacher"
 export WANDB_DIR="${COSMOS_RUN_DIR}/wandb"
 source scripts/setup_wandb.sh
-
 torchrun --standalone --nproc-per-node=8 \
   train.py \
-  --config_path configs/cosmos/t32_l21_camera_student_distillation.yaml \
+  --config_path configs/cosmos/t32_l21_camera_teacher_causal_flow.yaml \
   --logdir "${COSMOS_RUN_DIR}" \
   --wandb-save-dir "${WANDB_DIR}"
 ```
 
-### Non-Camera Student Distillation: t24/l21
+### Stage 2: Context-matched distillation
+
+#### Non-camera student: T24 / L21
 
 [`configs/cosmos/t24_l21_student_context_distillation.yaml`](configs/cosmos/t24_l21_student_context_distillation.yaml)
 
@@ -110,14 +127,56 @@ torchrun --standalone --nproc-per-node=8 \
   --wandb-save-dir "${WANDB_DIR}"
 ```
 
+#### Camera student: T32 / L21
+
+[`configs/cosmos/t32_l21_camera_student_distillation.yaml`](configs/cosmos/t32_l21_camera_student_distillation.yaml)
+
+```bash
+source scripts/setup_huggingface.sh
+
+export COSMOS_RUN_DIR="logs/t32_l21_camera_student_distillation"
+export WANDB_DIR="${COSMOS_RUN_DIR}/wandb"
+source scripts/setup_wandb.sh
+
+torchrun --standalone --nproc-per-node=8 \
+  train.py \
+  --config_path configs/cosmos/t32_l21_camera_student_distillation.yaml \
+  --logdir "${COSMOS_RUN_DIR}" \
+  --wandb-save-dir "${WANDB_DIR}"
+```
+
+### Stage 3: Long-video distillation
+
+[`configs/cosmos/t24_l21_rollout_context_distillation.yaml`](configs/cosmos/t24_l21_rollout_context_distillation.yaml)
+
+```bash
+source scripts/setup_huggingface.sh
+export COSMOS_RUN_DIR="logs/t24_l21_rollout_context_distillation"
+export WANDB_DIR="${COSMOS_RUN_DIR}/wandb"
+source scripts/setup_wandb.sh
+
+torchrun --standalone --nproc-per-node=8 \
+  train.py \
+  --config_path configs/cosmos/t24_l21_rollout_context_distillation.yaml \
+  --logdir "${COSMOS_RUN_DIR}" \
+  --wandb-save-dir "${WANDB_DIR}"
+```
+
 ## Citation
 
 ```bibtex
-@misc{bandyopadhyay2026contextmatched,
-  title  = {Context-Matched Distillation: Teacher Causality for Autoregressive Video Distillation},
-  author = {Bandyopadhyay, Hmrishav and Ren, Xuanchi and Huang, Zijian and Wu, Jay Zhangjie and Cao, Tianshi and Li, Ruilong and Chu, Bryan and Fidler, Sanja and Song, Yi-Zhe and Wang, Zian},
-  year   = {2026},
-  url    = {https://hmrishavbandy.github.io/cmd-site/}
+@article{bandyopadhyay2026context,
+  title   = {Context-Matched Distillation: Teacher Causality for Autoregressive Video Distillation},
+  author  = {Bandyopadhyay, Hmrishav and Ren, Xuanchi and Huang, Zijian
+             and Wu, Jay Zhangjie and Cao, Tianshi and Li, Ruilong
+             and Chu, Bryan and Fidler, Sanja and Song, Yi-Zhe
+             and Wang, Zian},
+  journal = {arXiv preprint arXiv:2608.13391},
+  year    = {2026},
+  eprint  = {2608.13391},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CV},
+  url     = {https://arxiv.org/abs/2608.13391}
 }
 ```
 

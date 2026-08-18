@@ -124,68 +124,6 @@ def _full_sequence_query_ranges(
     return query_ranges
 
 
-def _teacher_forcing_query_ranges(
-    *,
-    sequence_length: int,
-    tokens_per_frame: int,
-    num_frame_per_block: int,
-    independent_first_frame: bool,
-    local_attn_size: int,
-    sink_size: int,
-) -> list[tuple[int, int, tuple[tuple[int, int], ...]]]:
-    """Describe clean-past plus noisy-current teacher-forcing attention."""
-    kv_length = 2 * sequence_length
-    block_tokens = num_frame_per_block * tokens_per_frame
-    prefix_tokens = tokens_per_frame if independent_first_frame else 0
-    use_local_attn = local_attn_size > 0
-    sink_tokens = max(sink_size, 0) * tokens_per_frame
-    window_tokens = max(local_attn_size - sink_size, 0) * tokens_per_frame
-
-    query_ranges = []
-    if prefix_tokens:
-        query_ranges.append(
-            (
-                0,
-                prefix_tokens,
-                _merge_intervals(
-                    [(sequence_length, sequence_length + prefix_tokens)],
-                    kv_length,
-                ),
-            )
-        )
-    for query_start in range(prefix_tokens, sequence_length, block_tokens):
-        raw_query_end = query_start + block_tokens
-        query_end = min(raw_query_end, sequence_length)
-        if use_local_attn:
-            recent_start = max(raw_query_end - window_tokens, 0)
-            promoted_sink_end = min(
-                query_start,
-                sink_tokens,
-                recent_start,
-            )
-            recent_start = max(promoted_sink_end, recent_start)
-            intervals = [
-                (0, promoted_sink_end),
-                (recent_start, query_start),
-            ]
-        else:
-            intervals = [(0, query_start)]
-        intervals.append(
-            (
-                sequence_length + query_start,
-                sequence_length + raw_query_end,
-            )
-        )
-        query_ranges.append(
-            (
-                query_start,
-                query_end,
-                _merge_intervals(intervals, kv_length),
-            )
-        )
-    return query_ranges
-
-
 def _build_sparse_block_rows(
     *,
     query_ranges: list[
@@ -342,7 +280,6 @@ class CausalCosmosAttention(AttentionOpWithKVCache):
     """Causal full-sequence attention and past-only streaming attention."""
 
     _block_mask_cache: dict[tuple, BlockMask] = {}
-    _teacher_mask_cache: dict[tuple, BlockMask] = {}
 
     def __init__(self, local_attn_size: int = -1, sink_size: int = 0) -> None:
         if local_attn_size == 0 or local_attn_size < -1:
@@ -356,9 +293,117 @@ class CausalCosmosAttention(AttentionOpWithKVCache):
         self.independent_first_frame = False
 
     def reset_kv_cache(self, max_cache_size: Optional[int] = None) -> None:
-        self.k_cache: dict[int, torch.Tensor] = {}
-        self.v_cache: dict[int, torch.Tensor] = {}
+        self.k_cache: Optional[torch.Tensor] = None
+        self.v_cache: Optional[torch.Tensor] = None
+        self._cache_slot_by_frame: dict[int, int] = {}
+        self._cache_frame_by_slot: dict[int, int] = {}
+        self._cache_tokens_per_frame: Optional[int] = None
+        self._cache_slot_indices: dict[tuple[int, ...], torch.Tensor] = {}
         self.max_cache_size = max_cache_size
+
+    def _cache_capacity(self, required_frames: int) -> int:
+        # Training may retain more frames than the logical attention window so
+        # activation-checkpoint recomputation sees the original cache history.
+        local_capacity = (
+            self.sink_size + self.local_attn_size
+            if self.local_attn_size > 0
+            else 1
+        )
+        return max(
+            required_frames,
+            local_capacity,
+            self.max_cache_size or 0,
+        )
+
+    def _initialize_cache_storage(
+        self,
+        value: torch.Tensor,
+        tokens_per_frame: int,
+        required_frames: int,
+    ) -> None:
+        capacity = self._cache_capacity(required_frames)
+        shape = (
+            value.shape[0],
+            capacity,
+            tokens_per_frame,
+            value.shape[2],
+            value.shape[3],
+        )
+        self.k_cache = torch.empty(shape, device=value.device, dtype=value.dtype)
+        self.v_cache = torch.empty(shape, device=value.device, dtype=value.dtype)
+        self._cache_tokens_per_frame = tokens_per_frame
+
+    def _cache_slot(self, frame_index: int) -> int:
+        if self.k_cache is None:
+            raise RuntimeError("Cosmos K/V cache storage is not initialized")
+        capacity = self.k_cache.shape[1]
+        if frame_index < self.sink_size:
+            return frame_index
+        recent_capacity = capacity - self.sink_size
+        if recent_capacity <= 0:
+            raise RuntimeError("Cosmos K/V cache has no recent-history capacity")
+        return self.sink_size + (
+            (frame_index - self.sink_size) % recent_capacity
+        )
+
+    def _store_cache_frame(
+        self,
+        frame_index: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> None:
+        tokens_per_frame = k.shape[1]
+        if self.k_cache is None or self.v_cache is None:
+            self._initialize_cache_storage(
+                k,
+                tokens_per_frame,
+                frame_index + 1,
+            )
+        if self._cache_tokens_per_frame != tokens_per_frame:
+            raise ValueError("Cosmos K/V cache token geometry changed")
+        if (
+            self.k_cache.shape[0] != k.shape[0]
+            or self.k_cache.shape[3:] != k.shape[2:]
+            or self.k_cache.device != k.device
+            or self.k_cache.dtype != k.dtype
+        ):
+            raise ValueError("Cosmos K/V cache tensor geometry changed")
+
+        slot = self._cache_slot(frame_index)
+        replaced_frame = self._cache_frame_by_slot.get(slot)
+        if replaced_frame is not None:
+            self._cache_slot_by_frame.pop(replaced_frame, None)
+        self.k_cache[:, slot].copy_(k.detach())
+        self.v_cache[:, slot].copy_(v.detach())
+        self._cache_slot_by_frame[frame_index] = slot
+        self._cache_frame_by_slot[slot] = frame_index
+
+    def _read_cache_frames(
+        self,
+        frame_indices: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.k_cache is None or self.v_cache is None:
+            raise RuntimeError("Cosmos K/V cache is empty")
+        missing = [
+            index for index in frame_indices
+            if index not in self._cache_slot_by_frame
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Cosmos KV cache is missing frames: {missing[:4]}"
+            )
+        slots = tuple(self._cache_slot_by_frame[index] for index in frame_indices)
+        slot_indices = self._cache_slot_indices.get(slots)
+        if slot_indices is None:
+            slot_indices = torch.tensor(
+                slots,
+                device=self.k_cache.device,
+                dtype=torch.long,
+            )
+            self._cache_slot_indices[slots] = slot_indices
+        cached_k = self.k_cache.index_select(1, slot_indices).flatten(1, 2)
+        cached_v = self.v_cache.index_select(1, slot_indices).flatten(1, 2)
+        return cached_k, cached_v
 
     def _full_sequence_attention(
         self,
@@ -510,191 +555,38 @@ class CausalCosmosAttention(AttentionOpWithKVCache):
             )
         return block_mask, padded_length
 
-    def _teacher_forcing_attention(
+    def _packed_score_attention(
         self,
         q: torch.Tensor,
-        noisy_k: torch.Tensor,
-        noisy_v: torch.Tensor,
-        teacher_kv: tuple[torch.Tensor, torch.Tensor],
+        k: torch.Tensor,
+        v: torch.Tensor,
+        teacher_forcing_layout: tuple[int, int],
         video_size: VideoSize,
     ) -> torch.Tensor:
-        """Attend to clean past blocks and the noisy current block in one call."""
-        clean_k, clean_v = teacher_kv
-        if q.shape != noisy_k.shape or noisy_k.shape != noisy_v.shape:
-            raise ValueError("Teacher forcing requires matching noisy Q/K/V shapes")
-        if clean_k.shape != noisy_k.shape or clean_v.shape != noisy_v.shape:
-            raise ValueError("Clean and noisy teacher-forcing K/V shapes must match")
+        """Run retained history and current targets through one causal mask."""
+        context_frames, noisy_start_frame = teacher_forcing_layout
+        if context_frames != noisy_start_frame:
+            raise ValueError("Packed score history must precede current targets")
+        return self._full_sequence_attention(q, k, v, video_size)
 
-        tokens_per_frame = video_size.H * video_size.W
-        sequence_length = video_size.T * tokens_per_frame
-        if q.shape[1] != sequence_length:
-            raise ValueError(
-                f"Expected {sequence_length} video tokens, received {q.shape[1]}"
-            )
-        block_mask, q_padding, kv_padding = self._teacher_forcing_mask(
-            device=q.device,
-            num_frames=video_size.T,
-            tokens_per_frame=tokens_per_frame,
-        )
-
-        if q_padding:
-            q = torch.cat(
-                [
-                    q,
-                    q.new_zeros(q.shape[0], q_padding, q.shape[2], q.shape[3]),
-                ],
-                dim=1,
-            )
-        k = torch.cat([clean_k, noisy_k], dim=1)
-        v = torch.cat([clean_v, noisy_v], dim=1)
-        if kv_padding:
-            padding = k.new_zeros(
-                k.shape[0], kv_padding, k.shape[2], k.shape[3]
-            )
-            k = torch.cat([k, padding], dim=1)
-            v = torch.cat([v, padding], dim=1)
-
-        output = flex_attention(
-            query=q.transpose(1, 2),
-            key=k.transpose(1, 2),
-            value=v.transpose(1, 2),
-            block_mask=block_mask,
-        ).transpose(1, 2)
-        if q_padding:
-            output = output[:, :-q_padding]
-        return output.flatten(2)
-
-    def _teacher_forcing_mask(
+    def _history_indices(
         self,
-        *,
-        device: torch.device,
-        num_frames: int,
-        tokens_per_frame: int,
-    ) -> tuple[BlockMask, int, int]:
-        """Build a sparse [noisy Q, clean K + noisy K] block-causal mask."""
-        sequence_length = num_frames * tokens_per_frame
-        q_total = math.ceil(sequence_length / 128) * 128
-        kv_length = 2 * sequence_length
-        kv_total = math.ceil(kv_length / 128) * 128
-        q_padding = q_total - sequence_length
-        kv_padding = kv_total - kv_length
-        cache_key = (
-            str(device),
-            num_frames,
-            tokens_per_frame,
-            self.num_frame_per_block,
-            self.independent_first_frame,
-            self.local_attn_size,
-            self.sink_size,
-        )
-        if cache_key in self._teacher_mask_cache:
-            return (
-                self._teacher_mask_cache[cache_key],
-                q_padding,
-                kv_padding,
-            )
-
-        block_tokens = self.num_frame_per_block * tokens_per_frame
-        prefix_tokens = tokens_per_frame if self.independent_first_frame else 0
-        use_local_attn = self.local_attn_size > 0
-        sink_tokens = max(self.sink_size, 0) * tokens_per_frame
-        window_tokens = (
-            max(self.local_attn_size - self.sink_size, 0)
-            * tokens_per_frame
-        )
-
-        query_ranges = _teacher_forcing_query_ranges(
-            sequence_length=sequence_length,
-            tokens_per_frame=tokens_per_frame,
-            num_frame_per_block=self.num_frame_per_block,
-            independent_first_frame=self.independent_first_frame,
-            local_attn_size=self.local_attn_size,
-            sink_size=self.sink_size,
-        )
-
-        def attention_mask(_batch, _head, query_index, key_index):
-            valid_query = query_index < sequence_length
-            valid_key = key_index < kv_length
-            clean_key = key_index < sequence_length
-            key_position = torch.where(
-                clean_key,
-                key_index,
-                key_index - sequence_length,
-            )
-            query_is_prefix = query_index < prefix_tokens
-            key_is_prefix = key_position < prefix_tokens
-            query_block = torch.where(
-                query_is_prefix,
-                query_index - query_index - 1,
-                (query_index - prefix_tokens) // block_tokens,
-            )
-            key_block = torch.where(
-                key_is_prefix,
-                key_position - key_position - 1,
-                (key_position - prefix_tokens) // block_tokens,
-            )
-            query_start = torch.where(
-                query_is_prefix,
-                query_index - query_index,
-                prefix_tokens + query_block * block_tokens,
-            )
-            query_end = torch.where(
-                query_is_prefix,
-                query_index - query_index + prefix_tokens,
-                query_start + block_tokens,
-            )
-
-            clean_past = clean_key & (~query_is_prefix) & (
-                key_is_prefix | (key_block < query_block)
-            )
-            if use_local_attn:
-                zero = query_end - query_end
-                recent_start = torch.maximum(
-                    query_end - window_tokens,
-                    zero,
-                )
-                promoted_sink_end = torch.minimum(
-                    torch.minimum(query_start, zero + sink_tokens),
-                    recent_start,
-                )
-                recent_start = torch.maximum(
-                    promoted_sink_end,
-                    recent_start,
-                )
-                clean_past = clean_past & (
-                    (key_position < promoted_sink_end)
-                    | (
-                        (key_position >= recent_start)
-                        & (key_position < query_start)
-                    )
-                )
-
-            noisy_current = (~clean_key) & (key_block == query_block)
-            return valid_query & valid_key & (clean_past | noisy_current)
-
-        block_mask = _block_mask_from_intervals(
-            query_ranges=query_ranges,
-            q_total=q_total,
-            kv_total=kv_total,
-            mask_mod=attention_mask,
-            device=device,
-        )
-        self._teacher_mask_cache[cache_key] = block_mask
-        if not dist.is_initialized() or dist.get_rank() == 0:
-            print(
-                "Cached Cosmos teacher-forcing attention mask: "
-                f"frames={num_frames}, block_frames={self.num_frame_per_block}, "
-                f"tokens_per_frame={tokens_per_frame}",
-                flush=True,
-            )
-        return block_mask, q_padding, kv_padding
-
-    def _history_indices(self, current_idx: int) -> list[int]:
+        current_idx: int,
+        current_frames: int = 1,
+    ) -> list[int]:
+        if current_frames <= 0:
+            raise ValueError("current_frames must be positive")
         window = self.local_attn_size
         if window == -1:
-            window = self.max_cache_size or current_idx + 1
-        recent_start = max(self.sink_size, current_idx - window + 1)
-        sink = range(min(self.sink_size, current_idx))
+            recent_start = self.sink_size
+        else:
+            recent_window = max(window - self.sink_size, 0)
+            recent_history = max(recent_window - current_frames, 0)
+            recent_start = max(
+                self.sink_size,
+                current_idx - recent_history,
+            )
+        sink = range(min(self.sink_size, current_idx, recent_start))
         recent = range(recent_start, current_idx)
         return list(sink) + list(recent)
 
@@ -706,20 +598,20 @@ class CausalCosmosAttention(AttentionOpWithKVCache):
         *,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
         video_size: Optional[VideoSize] = None,
-        teacher_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        teacher_forcing_layout: Optional[tuple[int, int]] = None,
         **kwargs,
     ) -> torch.Tensor:
         del kwargs
-        if teacher_kv is not None:
+        if teacher_forcing_layout is not None:
             if kv_cache_cfg is not None and kv_cache_cfg.run_with_kv:
                 raise ValueError("Teacher forcing cannot be combined with KV caching")
             if video_size is None:
                 raise ValueError("video_size is required for teacher forcing")
-            return self._teacher_forcing_attention(
+            return self._packed_score_attention(
                 q,
                 k,
                 v,
-                teacher_kv,
+                teacher_forcing_layout,
                 video_size,
             )
         if kv_cache_cfg is None or not kv_cache_cfg.run_with_kv:
@@ -728,26 +620,40 @@ class CausalCosmosAttention(AttentionOpWithKVCache):
             return self._full_sequence_attention(q, k, v, video_size)
 
         current_idx = int(kv_cache_cfg.current_idx)
+        if kv_cache_cfg.store_kv and video_size is not None and video_size.T > 1:
+            tokens_per_frame = video_size.H * video_size.W
+            for frame_offset in range(video_size.T):
+                start = frame_offset * tokens_per_frame
+                end = start + tokens_per_frame
+                self._store_cache_frame(
+                    current_idx + frame_offset,
+                    k[:, start:end],
+                    v[:, start:end],
+                )
+            return self._full_sequence_attention(q, k, v, video_size)
+
         if kv_cache_cfg.store_kv:
-            self.k_cache[current_idx] = k.detach()
-            self.v_cache[current_idx] = v.detach()
+            self._store_cache_frame(current_idx, k, v)
 
-        history_indices = self._history_indices(current_idx)
-        missing = [index for index in history_indices if index not in self.k_cache]
-        if missing:
-            raise RuntimeError(f"Cosmos KV cache is missing frames: {missing[:4]}")
-
-        history_k = [self.k_cache[index] for index in history_indices]
-        history_v = [self.v_cache[index] for index in history_indices]
-        if history_k and history_k[0].shape[0] != k.shape[0]:
-            if history_k[0].shape[0] != 1:
+        current_frames = video_size.T if video_size is not None else 1
+        history_indices = self._history_indices(
+            current_idx,
+            current_frames=current_frames,
+        )
+        if history_indices:
+            history_k, history_v = self._read_cache_frames(history_indices)
+        else:
+            history_k = history_v = None
+        if history_k is not None and history_k.shape[0] != k.shape[0]:
+            if history_k.shape[0] != 1:
                 raise ValueError(
                     "Cached Cosmos batch cannot be broadcast to the current batch"
                 )
-            history_k = [item.expand(k.shape[0], *item.shape[1:]) for item in history_k]
-            history_v = [item.expand(v.shape[0], *item.shape[1:]) for item in history_v]
-        k = torch.cat(history_k + [k], dim=1) if history_k else k
-        v = torch.cat(history_v + [v], dim=1) if history_v else v
+            history_k = history_k.expand(k.shape[0], *history_k.shape[1:])
+            history_v = history_v.expand(v.shape[0], *history_v.shape[1:])
+        if history_k is not None:
+            k = torch.cat((history_k, k), dim=1)
+            v = torch.cat((history_v, v), dim=1)
         return i4_attention_op(q, k, v)
 
     def set_context_parallel_group(self, *args, **kwargs) -> None:
@@ -809,25 +715,34 @@ class CausalCosmosModel(MinimalV1LVGDiT):
         fps: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
         condition_video_input_mask_B_C_T_H_W: Optional[torch.Tensor] = None,
+        clean_condition_video_input_mask_B_C_T_H_W: Optional[torch.Tensor] = None,
         camera_condition_B_C_T_H_W: Optional[torch.Tensor] = None,
+        noisy_start_frame: int,
     ) -> torch.Tensor:
-        """Score a full noisy sequence from clean strict-past block context.
-
-        A no-grad context pass first caches clean K/V for every layer.  A second
-        noisy pass uses those K/V so queries attend clean preceding blocks and
-        noisy tokens from their current block.
-        """
-        if condition_video_input_mask_B_C_T_H_W is None:
-            raise ValueError("condition_video_input_mask_B_C_T_H_W is required")
-        if noisy_x_B_C_T_H_W.shape != clean_x_B_C_T_H_W.shape:
-            raise ValueError("Clean and noisy teacher-forcing inputs must match")
-        if noisy_timesteps_B_T.shape != clean_timesteps_B_T.shape:
-            raise ValueError("Clean and noisy teacher-forcing timesteps must match")
+        """Score packed history and all current noisy targets in one pass."""
+        if (
+            condition_video_input_mask_B_C_T_H_W is None
+            or clean_condition_video_input_mask_B_C_T_H_W is None
+        ):
+            raise ValueError("Noisy and clean condition masks are required")
         if noisy_timesteps_B_T.ndim == 1:
             noisy_timesteps_B_T = noisy_timesteps_B_T.unsqueeze(1)
+        if clean_timesteps_B_T.ndim == 1:
             clean_timesteps_B_T = clean_timesteps_B_T.unsqueeze(1)
-        if noisy_timesteps_B_T.shape[1] != noisy_x_B_C_T_H_W.shape[2]:
-            raise ValueError("Teacher-forcing timesteps must cover every frame")
+        noisy_frames = noisy_x_B_C_T_H_W.shape[2]
+        context_frames = clean_x_B_C_T_H_W.shape[2]
+        if (
+            noisy_x_B_C_T_H_W.shape[:2] != clean_x_B_C_T_H_W.shape[:2]
+            or noisy_x_B_C_T_H_W.shape[-2:] != clean_x_B_C_T_H_W.shape[-2:]
+            or context_frames != noisy_start_frame
+        ):
+            raise ValueError("Packed scoring requires history before noisy targets")
+        if not 0 < noisy_start_frame < noisy_frames:
+            raise ValueError("noisy_start_frame must select a non-empty suffix")
+        if noisy_timesteps_B_T.shape != (noisy_x_B_C_T_H_W.shape[0], noisy_frames):
+            raise ValueError("Noisy timesteps must cover every noisy frame")
+        if clean_timesteps_B_T.shape != (clean_x_B_C_T_H_W.shape[0], context_frames):
+            raise ValueError("Clean timesteps must cover every history frame")
 
         noisy_input = torch.cat(
             [
@@ -841,13 +756,13 @@ class CausalCosmosModel(MinimalV1LVGDiT):
         clean_input = torch.cat(
             [
                 clean_x_B_C_T_H_W,
-                condition_video_input_mask_B_C_T_H_W.type_as(
+                clean_condition_video_input_mask_B_C_T_H_W.type_as(
                     clean_x_B_C_T_H_W
                 ),
             ],
             dim=1,
         )
-        noisy_hidden, rope, noisy_extra_pos = self.prepare_embedded_sequence(
+        noisy_hidden, noisy_rope, noisy_extra_pos = self.prepare_embedded_sequence(
             noisy_input,
             fps=fps,
             padding_mask=padding_mask,
@@ -860,12 +775,33 @@ class CausalCosmosModel(MinimalV1LVGDiT):
                     padding_mask=padding_mask,
                 )
             )
-        if clean_hidden.shape != noisy_hidden.shape:
-            raise ValueError("Embedded clean and noisy video grids must match")
-        if rope is None or clean_rope is None:
+        if clean_hidden.shape[:1] + clean_hidden.shape[2:] != noisy_hidden.shape[:1] + noisy_hidden.shape[2:]:
+            raise ValueError("Embedded history and noisy video grids must match")
+        if noisy_rope is None or clean_rope is None:
             raise ValueError("Causal Cosmos teacher forcing requires RoPE")
+        tokens_per_frame = noisy_hidden.shape[2] * noisy_hidden.shape[3]
+        target_hidden = noisy_hidden[:, noisy_start_frame:]
+        packed_hidden = torch.cat([clean_hidden, target_hidden], dim=1)
+        packed_rope = torch.cat(
+            [
+                clean_rope,
+                noisy_rope[noisy_start_frame * tokens_per_frame:],
+            ],
+            dim=0,
+        )
 
-        camera = None
+        def pack_optional(clean_value, noisy_value):
+            if clean_value is None or noisy_value is None:
+                if clean_value is not None or noisy_value is not None:
+                    raise ValueError("Packed score embeddings must match")
+                return None
+            return torch.cat(
+                [clean_value, noisy_value[:, noisy_start_frame:]], dim=1
+            )
+
+        packed_extra_pos = pack_optional(clean_extra_pos, noisy_extra_pos)
+
+        packed_camera = None
         if camera_condition_B_C_T_H_W is not None:
             camera = camera_condition_B_C_T_H_W.permute(
                 0, 2, 3, 4, 1
@@ -875,6 +811,10 @@ class CausalCosmosModel(MinimalV1LVGDiT):
                     "Camera conditioning does not match the teacher-forcing grid: "
                     f"{tuple(camera.shape)} versus {tuple(noisy_hidden.shape)}"
                 )
+            packed_camera = torch.cat(
+                [camera[:, :context_frames], camera[:, noisy_start_frame:]],
+                dim=1,
+            )
 
         if self.use_crossattn_projection:
             crossattn_emb = self.crossattn_proj(crossattn_emb)
@@ -888,45 +828,48 @@ class CausalCosmosModel(MinimalV1LVGDiT):
                 clean_timesteps_B_T
             )
             clean_time = self.t_embedding_norm(clean_time)
+        packed_time = torch.cat(
+            [clean_time, noisy_time[:, noisy_start_frame:]], dim=1
+        )
+        packed_adaln_lora = pack_optional(clean_adaln_lora, noisy_adaln_lora)
 
-        clean_kv_by_layer = []
-        with torch.no_grad():
-            for block in self.blocks:
-                clean_hidden, clean_kv = block(
-                    clean_hidden,
-                    clean_time,
-                    crossattn_emb,
-                    rope_emb_L_1_1_D=rope,
-                    adaln_lora_B_T_3D=clean_adaln_lora,
-                    extra_per_block_pos_emb=clean_extra_pos,
-                    camera_B_T_H_W_C=camera,
-                    return_self_attn_kv=True,
-                )
-                clean_kv_by_layer.append(clean_kv)
-        del clean_hidden
-
-        for block, clean_kv in zip(
-            self.blocks,
-            clean_kv_by_layer,
-            strict=True,
-        ):
-            noisy_hidden = block(
-                noisy_hidden,
-                noisy_time,
+        layout = (context_frames, noisy_start_frame)
+        for block in self.blocks:
+            packed_hidden = block(
+                packed_hidden,
+                packed_time,
                 crossattn_emb,
-                rope_emb_L_1_1_D=rope,
-                adaln_lora_B_T_3D=noisy_adaln_lora,
-                extra_per_block_pos_emb=noisy_extra_pos,
-                camera_B_T_H_W_C=camera,
-                teacher_kv=clean_kv,
+                rope_emb_L_1_1_D=packed_rope,
+                adaln_lora_B_T_3D=packed_adaln_lora,
+                extra_per_block_pos_emb=packed_extra_pos,
+                camera_B_T_H_W_C=packed_camera,
+                teacher_forcing_layout=layout,
+            )
+            packed_hidden = torch.cat(
+                [
+                    packed_hidden[:, :context_frames].detach(),
+                    packed_hidden[:, context_frames:],
+                ],
+                dim=1,
             )
 
         output = self.final_layer(
-            noisy_hidden,
-            noisy_time,
-            adaln_lora_B_T_3D=noisy_adaln_lora,
+            packed_hidden[:, context_frames:],
+            packed_time[:, context_frames:],
+            adaln_lora_B_T_3D=(
+                packed_adaln_lora[:, context_frames:]
+                if packed_adaln_lora is not None else None
+            ),
         )
-        return self.unpatchify(output)
+        scored_suffix = self.unpatchify(output)
+        prefix = scored_suffix.new_zeros(
+            scored_suffix.shape[0],
+            scored_suffix.shape[1],
+            noisy_start_frame,
+            scored_suffix.shape[3],
+            scored_suffix.shape[4],
+        )
+        return torch.cat([prefix, scored_suffix], dim=2)
 
     def forward_seq(
         self,
@@ -939,6 +882,7 @@ class CausalCosmosModel(MinimalV1LVGDiT):
         padding_mask: Optional[torch.Tensor] = None,
         condition_video_input_mask_B_C_T_H_W: Optional[torch.Tensor] = None,
         camera_condition_B_C_T_H_W: Optional[torch.Tensor] = None,
+        full_video_size: Optional[tuple[int, int, int]] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
     ) -> torch.Tensor:
         """Run one causal sequence chunk using the same blocks and weights."""
@@ -980,9 +924,12 @@ class CausalCosmosModel(MinimalV1LVGDiT):
         time_embedding, adaln_lora = self.t_embedder(timesteps_B_T)
         time_embedding = self.t_embedding_norm(time_embedding)
 
-        full_t = int(video_pos.pos_t.max().item()) + 1
-        full_h = int(video_pos.pos_h.max().item()) + 1
-        full_w = int(video_pos.pos_w.max().item()) + 1
+        if full_video_size is None:
+            full_t = int(video_pos.pos_t.max().item()) + 1
+            full_h = int(video_pos.pos_h.max().item()) + 1
+            full_w = int(video_pos.pos_w.max().item()) + 1
+        else:
+            full_t, full_h, full_w = full_video_size
         rope = self.pos_embedder.generate_embeddings(
             torch.Size([1, full_t, full_h, full_w, self.model_channels])
         )

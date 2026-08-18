@@ -81,11 +81,18 @@ class SelfForcingTrainingPipeline:
             self,
             noise: torch.Tensor,
             initial_latent: Optional[torch.Tensor] = None,
+            context_latents: Optional[torch.Tensor] = None,
+            exit_step: Optional[int] = None,
             return_sim_step: bool = False,
             **conditional_dict
     ) -> torch.Tensor:
+        if initial_latent is not None and context_latents is not None:
+            raise ValueError("Pass either initial_latent or context_latents")
+        cached_latents = (
+            context_latents if context_latents is not None else initial_latent
+        )
         batch_size, num_frames, num_channels, height, width = noise.shape
-        if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
+        if not self.independent_first_frame or cached_latents is not None:
             # If the first frame is independent and the first frame is provided, then the number of frames in the
             # noise should still be a multiple of num_frame_per_block
             assert num_frames % self.num_frame_per_block == 0
@@ -94,7 +101,9 @@ class SelfForcingTrainingPipeline:
             # Using a [1, 4, 4, 4, 4, 4, ...] model to generate a video without image conditioning
             assert (num_frames - 1) % self.num_frame_per_block == 0
             num_blocks = (num_frames - 1) // self.num_frame_per_block
-        num_input_frames = initial_latent.shape[1] if initial_latent is not None else 0
+        num_input_frames = (
+            cached_latents.shape[1] if cached_latents is not None else 0
+        )
         num_output_frames = num_frames + num_input_frames  # add the initial latent frames
         output = torch.zeros(
             [batch_size, num_output_frames, num_channels, height, width],
@@ -133,28 +142,49 @@ class SelfForcingTrainingPipeline:
 
         # Step 2: Cache context feature
         current_start_frame = 0
-        if initial_latent is not None:
-            timestep = torch.ones([batch_size, 1], device=noise.device, dtype=torch.int64) * 0
-            # Assume num_input_frames is 1 + self.num_frame_per_block * num_input_blocks
-            output[:, :1] = initial_latent
+        if cached_latents is not None:
+            cached_latents = cached_latents.to(noise)
+            output[:, :num_input_frames] = cached_latents
+            cache_noise = self.context_noise if context_latents is not None else 0
+            timestep = torch.full(
+                (batch_size, num_input_frames), cache_noise,
+                device=noise.device, dtype=torch.int64,
+            )
+            cache_input = cached_latents
+            if cache_noise:
+                cache_input = self.scheduler.add_noise(
+                    cache_input.flatten(0, 1),
+                    torch.randn_like(cache_input.flatten(0, 1)),
+                    timestep.flatten(0, 1),
+                ).unflatten(0, cache_input.shape[:2])
             with torch.no_grad():
                 self.generator(
-                    noisy_image_or_video=initial_latent,
+                    noisy_image_or_video=cache_input,
                     conditional_dict=conditional_dict,
-                    timestep=timestep * 0,
+                    timestep=timestep,
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
-                    current_start=self._cache_position(current_start_frame)
+                    current_start=self._cache_position(0),
+                    store_kv=True,
                 )
-            current_start_frame += 1
+            current_start_frame = num_input_frames
 
         # Step 3: Temporal denoising loop
         all_num_frames = [self.num_frame_per_block] * num_blocks
-        if self.independent_first_frame and initial_latent is None:
+        if self.independent_first_frame and cached_latents is None:
             all_num_frames = [1] + all_num_frames
         num_denoising_steps = len(self.denoising_step_list)
-        exit_flags = self.generate_and_sync_list(len(all_num_frames), num_denoising_steps, device=noise.device)
-        start_gradient_frame_index = num_output_frames - self.gradient_window_frames
+        exit_flags = (
+            self.generate_and_sync_list(
+                len(all_num_frames), num_denoising_steps, device=noise.device
+            )
+            if exit_step is None else [exit_step] * len(all_num_frames)
+        )
+        start_gradient_frame_index = (
+            num_input_frames
+            if context_latents is not None
+            else num_output_frames - self.gradient_window_frames
+        )
 
         # for block_index in range(num_blocks):
         for block_index, current_num_frames in enumerate(all_num_frames):

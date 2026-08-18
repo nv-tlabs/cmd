@@ -20,7 +20,7 @@ ts_schedule: false
 num_train_timestep: 1000
 timestep_shift: 5.0
 context_noise: 128
-validation_interval: 20
+validation_interval: 50
 validation_at_start: false
 validation_seed: 12345
 validation_fps: 16

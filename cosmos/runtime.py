@@ -24,12 +24,30 @@ attention paths.  Keeping these helpers local avoids importing the full
 """
 
 import logging
+from functools import lru_cache
 from enum import Enum
 from typing import Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import nn
+
+try:
+    from transformer_engine.pytorch.attention import (
+        DotProductAttention as _TransformerEngineAttention,
+    )
+    try:
+        from transformer_engine.pytorch.attention.rope import (
+            apply_rotary_pos_emb as _transformer_engine_rope,
+        )
+    except ImportError:
+        from transformer_engine.pytorch.attention import (
+            apply_rotary_pos_emb as _transformer_engine_rope,
+        )
+except ImportError:
+    _TransformerEngineAttention = None
+    _transformer_engine_rope = None
 
 
 log = logging.getLogger(__name__)
@@ -45,7 +63,7 @@ class DataType(str, Enum):
 
 
 class RMSNorm(nn.Module):
-    """RMSNorm with the same single ``weight`` parameter as TE RMSNorm."""
+    """Checkpoint-compatible RMSNorm backed by PyTorch's fused operator."""
 
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -56,10 +74,12 @@ class RMSNorm(nn.Module):
         nn.init.ones_(self.weight)
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
-        normalized = value.float() * torch.rsqrt(
-            value.float().square().mean(dim=-1, keepdim=True) + self.eps
+        return F.rms_norm(
+            value,
+            (value.shape[-1],),
+            self.weight,
+            self.eps,
         )
-        return normalized.to(value.dtype) * self.weight
 
 
 def apply_rotary_pos_emb(
@@ -69,15 +89,40 @@ def apply_rotary_pos_emb(
     tensor_format: str = "bshd",
     fused: bool = True,
 ) -> torch.Tensor:
-    """Apply the split-half RoPE convention used by Predict2.5."""
-    del fused
+    """Apply rotary embeddings with the fused CUDA implementation when present."""
     if tensor_format != "bshd":
         raise ValueError(f"Unsupported rotary tensor format: {tensor_format}")
+    if _transformer_engine_rope is not None and value.is_cuda:
+        return _transformer_engine_rope(
+            value.contiguous(),
+            freqs.contiguous(),
+            tensor_format=tensor_format,
+            fused=fused,
+        )
     if freqs.ndim == 4 and freqs.shape[0] == value.shape[1]:
         freqs = freqs.permute(1, 0, 2, 3)
     first, second = value.chunk(2, dim=-1)
     rotated = torch.cat((-second, first), dim=-1)
     return value * freqs.cos() + rotated * freqs.sin()
+
+
+@lru_cache(maxsize=None)
+def _get_transformer_engine_attention(
+    num_heads: int,
+    head_dim: int,
+) -> nn.Module:
+    if _TransformerEngineAttention is None:
+        raise RuntimeError("Transformer Engine attention is unavailable")
+    module = _TransformerEngineAttention(
+        num_heads,
+        head_dim,
+        num_gqa_groups=num_heads,
+        attention_dropout=0.0,
+        qkv_format="bshd",
+        attn_mask_type="no_mask",
+    )
+    module.eval()
+    return module
 
 
 def attention(
@@ -88,7 +133,30 @@ def attention(
     is_causal: bool = False,
     **_kwargs,
 ) -> torch.Tensor:
-    """Flash-SDPA attention for Cosmos tensors shaped ``[B, S, H, D]``."""
+    """Fused attention for Cosmos tensors shaped ``[B, S, H, D]``."""
+    if (
+        _TransformerEngineAttention is not None
+        and query.is_cuda
+        and not is_causal
+    ):
+        query = query.contiguous().clone()
+        key = key.contiguous().clone()
+        value = value.contiguous().clone()
+        fused_attention = _get_transformer_engine_attention(
+            int(query.shape[2]),
+            int(query.shape[3]),
+        )
+        output = fused_attention(
+            query,
+            key,
+            value,
+        )
+        if isinstance(output, tuple):
+            output = output[0]
+        if output.ndim == 3:
+            output = output.unflatten(-1, (query.shape[2], query.shape[3]))
+        return output
+
     output = torch.nn.functional.scaled_dot_product_attention(
         query.transpose(1, 2),
         key.transpose(1, 2),
@@ -99,11 +167,13 @@ def attention(
 
 
 class DotProductAttention(nn.Module):
-    """Local replacement for the unused TE attention backend."""
+    """Parameter-free attention module with the expected Cosmos interface."""
 
-    def __init__(self, *args, **kwargs) -> None:
-        del args, kwargs
+    def __init__(self, num_heads: int, head_dim: int, **kwargs) -> None:
+        del kwargs
         super().__init__()
+        self.num_heads = int(num_heads)
+        self.head_dim = int(head_dim)
 
     def forward(
         self,
@@ -112,7 +182,13 @@ class DotProductAttention(nn.Module):
         value: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        return attention(query, key, value, **kwargs).flatten(-2)
+        del kwargs
+        if query.shape[2:] != (self.num_heads, self.head_dim):
+            raise ValueError(
+                "Attention input shape does not match the configured heads: "
+                f"{tuple(query.shape)}"
+            )
+        return attention(query, key, value).flatten(-2)
 
     def set_context_parallel_group(self, *args, **kwargs) -> None:
         del args, kwargs

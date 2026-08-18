@@ -246,6 +246,9 @@ class Trainer:
                         getattr(self.config, "camera_frame_stride", 4)
                     ),
                     patch_size=int(getattr(self.config, "camera_patch_size", 16)),
+                    num_frame_per_block=int(
+                        getattr(self.config, "num_frame_per_block", 1)
+                    ),
                     expected_latent_frames=clean_latent.shape[1],
                     output_dtype=self.dtype,
                 )

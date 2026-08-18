@@ -140,6 +140,7 @@ class CausalInferencePipeline(torch.nn.Module):
                     image_width=int(self.args.width),
                     frame_stride=int(getattr(self.args, "camera_frame_stride", 4)),
                     patch_size=int(getattr(self.args, "camera_patch_size", 16)),
+                    num_frame_per_block=int(self.num_frame_per_block),
                     expected_latent_frames=num_output_frames,
                     output_dtype=noise.dtype,
                 )
@@ -217,6 +218,7 @@ class CausalInferencePipeline(torch.nn.Module):
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
                     current_start=self._cache_position(current_start_frame),
+                    store_kv=True,
                 )
                 current_start_frame += 1
             else:
@@ -235,6 +237,7 @@ class CausalInferencePipeline(torch.nn.Module):
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
                     current_start=self._cache_position(current_start_frame),
+                    store_kv=True,
                 )
                 current_start_frame += self.num_frame_per_block
 

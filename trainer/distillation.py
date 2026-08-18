@@ -25,7 +25,7 @@ from utils.distributed import (
     EMA_FSDP,
     create_fsdp2_device_mesh,
     distributed_clip_grad_norm_,
-    fsdp2_wrap_cosmos_score,
+    fsdp2_wrap_cosmos_model,
     fsdp_state_dict,
     fsdp_wrap,
     launch_distributed_job,
@@ -221,31 +221,35 @@ class Trainer:
             # before applying composable sharding.
             load_pretrained_components(self.model, config)
 
-        self.model.generator = fsdp_wrap(
-            self.model.generator,
-            sharding_strategy=config.sharding_strategy,
-            mixed_precision=config.mixed_precision,
-            wrap_strategy=config.generator_fsdp_wrap_strategy
-        )
-
         if use_fsdp2_scores:
             score_mesh = create_fsdp2_device_mesh()
-            self.model.real_score = fsdp2_wrap_cosmos_score(
+            self.model.generator = fsdp2_wrap_cosmos_model(
+                self.model.generator,
+                mesh=score_mesh,
+                mixed_precision=config.mixed_precision,
+            )
+            self.model.real_score = fsdp2_wrap_cosmos_model(
                 self.model.real_score,
                 mesh=score_mesh,
                 mixed_precision=config.mixed_precision,
             )
-            self.model.fake_score = fsdp2_wrap_cosmos_score(
+            self.model.fake_score = fsdp2_wrap_cosmos_model(
                 self.model.fake_score,
                 mesh=score_mesh,
                 mixed_precision=config.mixed_precision,
             )
             if self.is_main_process:
                 print(
-                    "Using explicit block-sharded FSDP2 for Cosmos score models",
+                    "Using explicit block-sharded FSDP2 for Cosmos models",
                     flush=True,
                 )
         else:
+            self.model.generator = fsdp_wrap(
+                self.model.generator,
+                sharding_strategy=config.sharding_strategy,
+                mixed_precision=config.mixed_precision,
+                wrap_strategy=config.generator_fsdp_wrap_strategy
+            )
             self.model.real_score = fsdp_wrap(
                 self.model.real_score,
                 sharding_strategy=config.sharding_strategy,
@@ -356,6 +360,9 @@ class Trainer:
         self.grad_accum_iter = int(getattr(config, "grad_accum_iter", 1))
         if self.grad_accum_iter <= 0:
             raise ValueError("grad_accum_iter must be positive")
+        self.rollout_num_chunks = int(getattr(config, "rollout_num_chunks", 1))
+        if self.rollout_num_chunks > 1 and self.grad_accum_iter != 1:
+            raise ValueError("Rollout training requires grad_accum_iter: 1")
         self.previous_time = None
 
     def save(self):
@@ -400,7 +407,10 @@ class Trainer:
                 generator_path,
             )
 
-    def fwdbwd_one_step(self, batch, train_generator, loss_scale=1.0):
+    def fwdbwd_one_step(
+        self, batch, train_generator, loss_scale=1.0,
+        rollout_chunk_index=None,
+    ):
         self.model.eval()  # prevent any randomness (e.g. dropout)
 
         if self.step % 20 == 0:
@@ -409,8 +419,10 @@ class Trainer:
         # Step 1: Get the next batch of text prompts
         text_prompts = batch["prompts"]
         if self.config.i2v:
-            clean_latent = None
-            image_latent = batch["ode_latent"][:, -1][:, 0:1, ].to(
+            clean_latent = batch["ode_latent"][:, -1].to(
+                device=self.device, dtype=self.dtype
+            ) if rollout_chunk_index is not None else None
+            image_latent = batch["ode_latent"][:, -1][:, 0:1].to(
                 device=self.device, dtype=self.dtype)
         else:
             clean_latent = None
@@ -463,6 +475,9 @@ class Trainer:
                     patch_size=int(
                         getattr(self.config, "camera_patch_size", 16)
                     ),
+                    num_frame_per_block=int(
+                        getattr(self.config, "num_frame_per_block", 1)
+                    ),
                     expected_latent_frames=image_or_video_shape[1],
                     output_dtype=self.dtype,
                 )
@@ -470,13 +485,18 @@ class Trainer:
                 unconditional_dict["camera_condition"] = camera_condition
 
         # Step 3: Store gradients for the generator (if training the generator)
+        rollout_kwargs = (
+            {"rollout_chunk_index": rollout_chunk_index}
+            if rollout_chunk_index is not None else {}
+        )
         if train_generator:
             generator_loss, generator_log_dict = self.model.generator_loss(
                 image_or_video_shape=image_or_video_shape,
                 conditional_dict=conditional_dict,
                 unconditional_dict=unconditional_dict,
                 clean_latent=clean_latent,
-                initial_latent=image_latent if self.config.i2v else None
+                initial_latent=image_latent if self.config.i2v else None,
+                **rollout_kwargs,
             )
 
             (generator_loss * loss_scale).backward()
@@ -495,7 +515,8 @@ class Trainer:
             conditional_dict=conditional_dict,
             unconditional_dict=unconditional_dict,
             clean_latent=clean_latent,
-            initial_latent=image_latent if self.config.i2v else None
+            initial_latent=image_latent if self.config.i2v else None,
+            **rollout_kwargs,
         )
 
         (critic_loss * loss_scale).backward()
@@ -550,9 +571,15 @@ class Trainer:
         )
 
         max_steps = getattr(self.config, "max_steps", None)
+        rollout_chunk = 0
+        generator_rollout_batch = None
+        critic_rollout_batch = None
         while max_steps is None or self.step < max_steps:
             validation_ran = False
-            TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
+            rollout_step = self.step // self.rollout_num_chunks
+            TRAIN_GENERATOR = (
+                rollout_step % self.config.dfake_gen_update_ratio == 0
+            )
             first_iteration = self.step == start_step
 
             # Train the generator
@@ -565,7 +592,12 @@ class Trainer:
                 self.generator_optimizer.zero_grad(set_to_none=True)
                 extras_list = []
                 for _ in range(self.grad_accum_iter):
-                    batch = next(self.dataloader)
+                    if self.rollout_num_chunks > 1:
+                        if rollout_chunk == 0:
+                            generator_rollout_batch = next(self.dataloader)
+                        batch = generator_rollout_batch
+                    else:
+                        batch = next(self.dataloader)
                     if validate_first_batch:
                         self.validation_callback.run(self, batch)
                         validate_first_batch = False
@@ -574,6 +606,9 @@ class Trainer:
                         batch,
                         True,
                         loss_scale=1.0 / self.grad_accum_iter,
+                        rollout_chunk_index=(
+                            rollout_chunk if self.rollout_num_chunks > 1 else None
+                        ),
                     )
                     extras_list.append(extra)
                 generator_log_dict = merge_dict_list(extras_list)
@@ -592,33 +627,48 @@ class Trainer:
                         flush=True,
                     )
 
-            # Train the critic
-            if self.is_main_process and first_iteration:
-                print(
-                    f"Starting critic forward/backward at step {self.step}",
-                    flush=True,
+            else:
+                if self.is_main_process and first_iteration:
+                    print(
+                        f"Starting critic forward/backward at step {self.step}",
+                        flush=True,
+                    )
+                self.critic_optimizer.zero_grad(set_to_none=True)
+                extras_list = []
+                for _ in range(self.grad_accum_iter):
+                    if self.rollout_num_chunks > 1:
+                        if rollout_chunk == 0:
+                            critic_rollout_batch = next(self.dataloader)
+                        batch = critic_rollout_batch
+                    else:
+                        batch = next(self.dataloader)
+                    extra = self.fwdbwd_one_step(
+                        batch,
+                        False,
+                        loss_scale=1.0 / self.grad_accum_iter,
+                        rollout_chunk_index=(
+                            rollout_chunk
+                            if self.rollout_num_chunks > 1 else None
+                        ),
+                    )
+                    extras_list.append(extra)
+                critic_log_dict = merge_dict_list(extras_list)
+                critic_log_dict["critic_grad_norm"] = (
+                    distributed_clip_grad_norm_(
+                        self.model.fake_score,
+                        self.max_grad_norm_critic
+                    )
                 )
-            self.critic_optimizer.zero_grad(set_to_none=True)
-            extras_list = []
-            for _ in range(self.grad_accum_iter):
-                batch = next(self.dataloader)
-                extra = self.fwdbwd_one_step(
-                    batch,
-                    False,
-                    loss_scale=1.0 / self.grad_accum_iter,
-                )
-                extras_list.append(extra)
-            critic_log_dict = merge_dict_list(extras_list)
-            critic_log_dict["critic_grad_norm"] = (
-                distributed_clip_grad_norm_(
-                    self.model.fake_score,
-                    self.max_grad_norm_critic
-                )
-            )
-            self.critic_optimizer.step()
+                self.critic_optimizer.step()
 
             # Increment the step since we finished gradient update
             self.step += 1
+            if self.rollout_num_chunks > 1:
+                rollout_chunk = (rollout_chunk + 1) % self.rollout_num_chunks
+                if rollout_chunk == 0:
+                    self.model.reset_rollout_state()
+                    generator_rollout_batch = None
+                    critic_rollout_batch = None
             if self.is_main_process and first_iteration:
                 print(f"Finished training step {self.step}", flush=True)
 
@@ -645,12 +695,13 @@ class Trainer:
                         }
                     )
 
-                wandb_loss_dict.update(
-                    {
-                        "critic_loss": critic_log_dict["critic_loss"].mean().item(),
-                        "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
-                    }
-                )
+                else:
+                    wandb_loss_dict.update(
+                        {
+                            "critic_loss": critic_log_dict["critic_loss"].mean().item(),
+                            "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
+                        }
+                    )
 
                 if not self.disable_wandb:
                     wandb.log(wandb_loss_dict, step=self.step)

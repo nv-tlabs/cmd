@@ -38,8 +38,9 @@ def camera_frame_indices(
 
 def frame_relative_camera_to_world(
     camera_to_world: torch.Tensor,
+    num_frame_per_block: int = 1,
 ) -> torch.Tensor:
-    """Express every camera after frame zero in the preceding camera's frame."""
+    """Express each generated block relative to the prior block boundary."""
     if camera_to_world.ndim != 4 or camera_to_world.shape[-2:] != (4, 4):
         raise ValueError(
             "camera_to_world must have shape [B, T, 4, 4]; got "
@@ -47,12 +48,25 @@ def frame_relative_camera_to_world(
         )
     if camera_to_world.shape[1] == 0:
         raise ValueError("camera_to_world must contain at least one frame")
+    if num_frame_per_block <= 0:
+        raise ValueError("num_frame_per_block must be positive")
 
     poses = camera_to_world.to(torch.float32)
-    relative = torch.empty_like(poses)
-    relative[:, 0] = torch.eye(4, device=poses.device, dtype=poses.dtype)
-    if poses.shape[1] > 1:
-        relative[:, 1:] = torch.linalg.solve(poses[:, :-1], poses[:, 1:])
+    frame_indices = torch.arange(
+        poses.shape[1],
+        device=poses.device,
+        dtype=torch.long,
+    )
+    # With an independent I2V prefix at frame zero, frames 1..C use frame 0,
+    # frames C+1..2C use frame C, and so on. For C=1 this reduces to the
+    # original previous-frame-relative convention.
+    anchor_indices = torch.div(
+        torch.clamp(frame_indices - 1, min=0),
+        num_frame_per_block,
+        rounding_mode="floor",
+    ) * num_frame_per_block
+    anchors = poses.index_select(1, anchor_indices)
+    relative = torch.linalg.solve(anchors, poses)
     return relative
 
 
@@ -178,10 +192,11 @@ def build_camera_conditioning(
     image_width: int,
     frame_stride: int = 4,
     patch_size: int = 16,
+    num_frame_per_block: int = 1,
     expected_latent_frames: int | None = None,
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Build frame-relative origin/direction camera tokens from pixel cameras."""
+    """Build block-relative origin/direction camera tokens from pixel cameras."""
     if camera_to_world.ndim != 4 or camera_to_world.shape[-2:] != (4, 4):
         raise ValueError("camera_to_world must have shape [B, T, 4, 4]")
     num_pixel_frames = camera_to_world.shape[1]
@@ -202,7 +217,10 @@ def build_camera_conditioning(
         indices,
         num_pixel_frames,
     )
-    relative_poses = frame_relative_camera_to_world(sampled_poses)
+    relative_poses = frame_relative_camera_to_world(
+        sampled_poses,
+        num_frame_per_block=num_frame_per_block,
+    )
     rays = camera_rays(
         relative_poses,
         sampled_intrinsics,

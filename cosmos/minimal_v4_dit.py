@@ -220,23 +220,6 @@ class SACConfig(_SACConfig):
 VideoSize = namedtuple("VideoSize", ["T", "H", "W"])
 
 
-class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-5):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def reset_parameters(self):
-        torch.nn.init.ones_(self.weight)
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
-
-
 # ---------------------- Feed Forward Network -----------------------
 class GPT2FeedForward(nn.Module):
     def __init__(self, d_model: int, d_ff: int):
@@ -551,14 +534,14 @@ class Attention(nn.Module):
         v,
         video_size: Optional[VideoSize] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
-        teacher_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        teacher_forcing_layout: Optional[tuple[int, int]] = None,
     ):
         additional_args = {}
         if isinstance(self.attn_op, (NattenA2AAttnOp, NeighborhoodAttention)) or self.backend == "i4":
             additional_args["video_size"] = video_size
         if isinstance(self.attn_op, AttentionOpWithKVCache):
             additional_args["kv_cache_cfg"] = kv_cache_cfg
-            additional_args["teacher_kv"] = teacher_kv
+            additional_args["teacher_forcing_layout"] = teacher_forcing_layout
 
         result = self.attn_op(q, k, v, **additional_args)  # [B, S, H, D]
         return self.output_dropout(self.output_proj(result))
@@ -570,8 +553,7 @@ class Attention(nn.Module):
         rope_emb: Optional[torch.Tensor] = None,
         video_size: Optional[VideoSize] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
-        teacher_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        return_kv: bool = False,
+        teacher_forcing_layout: Optional[tuple[int, int]] = None,
     ):
         """
         Args:
@@ -581,16 +563,21 @@ class Attention(nn.Module):
             video_size(VideoSize): Shape [T, H, W]
         """
         q, k, v = self.compute_qkv(x, context, rope_emb=rope_emb)
+        if teacher_forcing_layout is not None:
+            if video_size is None:
+                raise ValueError("video_size is required for packed teacher forcing")
+            context_frames, _ = teacher_forcing_layout
+            context_tokens = context_frames * video_size.H * video_size.W
+            k = torch.cat([k[:, :context_tokens].detach(), k[:, context_tokens:]], dim=1)
+            v = torch.cat([v[:, :context_tokens].detach(), v[:, context_tokens:]], dim=1)
         result = self.compute_attention(
             q,
             k,
             v,
             video_size=video_size,
             kv_cache_cfg=kv_cache_cfg,
-            teacher_kv=teacher_kv,
+            teacher_forcing_layout=teacher_forcing_layout,
         )
-        if return_kv:
-            return result, (k.detach(), v.detach())
         return result
 
     def set_context_parallel_group(self, process_group, ranks, stream, cp_comm_type: str = "p2p"):
@@ -1284,11 +1271,8 @@ class Block(nn.Module):
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
         camera_B_T_H_W_C: Optional[torch.Tensor] = None,
-        teacher_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        return_self_attn_kv: bool = False,
-    ) -> torch.Tensor | tuple[
-        torch.Tensor, tuple[torch.Tensor, torch.Tensor]
-    ]:
+        teacher_forcing_layout: Optional[tuple[int, int]] = None,
+    ) -> torch.Tensor:
         return self._forward_single(
             x_B_T_H_W_D,
             emb_B_T_D,
@@ -1298,8 +1282,7 @@ class Block(nn.Module):
             extra_per_block_pos_emb=extra_per_block_pos_emb,
             kv_cache_cfg=kv_cache_cfg,
             camera_B_T_H_W_C=camera_B_T_H_W_C,
-            teacher_kv=teacher_kv,
-            return_self_attn_kv=return_self_attn_kv,
+            teacher_forcing_layout=teacher_forcing_layout,
         )
 
     def _forward_single(
@@ -1312,11 +1295,8 @@ class Block(nn.Module):
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
         camera_B_T_H_W_C: Optional[torch.Tensor] = None,
-        teacher_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        return_self_attn_kv: bool = False,
-    ) -> torch.Tensor | tuple[
-        torch.Tensor, tuple[torch.Tensor, torch.Tensor]
-    ]:
+        teacher_forcing_layout: Optional[tuple[int, int]] = None,
+    ) -> torch.Tensor:
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
 
@@ -1395,11 +1375,8 @@ class Block(nn.Module):
             rope_emb=rope_emb_L_1_1_D,
             video_size=video_size,
             kv_cache_cfg=kv_cache_cfg,
-            teacher_kv=teacher_kv,
-            return_kv=return_self_attn_kv,
+            teacher_forcing_layout=teacher_forcing_layout,
         )
-        if return_self_attn_kv:
-            self_attn_result, projected_kv = self_attn_result
         result_B_T_H_W_D = rearrange(
             self_attn_result,
             "b (t h w) d -> b t h w d",
@@ -1450,8 +1427,6 @@ class Block(nn.Module):
         )
         result_B_T_H_W_D = self.mlp(normalized_x_B_T_H_W_D)
         x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp_B_T_1_1_D * result_B_T_H_W_D
-        if return_self_attn_kv:
-            return x_B_T_H_W_D, projected_kv
         return x_B_T_H_W_D
 
 
@@ -1954,7 +1929,6 @@ class MiniTrainDIT(WeightTrainingStat):
                 preserve_rng_state=False,
             ),
         )
-
         return self
 
     def fully_shard(self, mesh, **fsdp_kwargs):

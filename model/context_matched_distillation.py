@@ -37,8 +37,26 @@ class ContextMatchedDistillation(SelfForcingModel):
         if not self.context_matched_distillation:
             raise ValueError(
                 "ContextMatchedDistillation requires distribution_loss: context_matched"
-            )
+        )
         self.prefix_noise = int(getattr(args, "prefix_noise", 0))
+        self.rollout_num_chunks = int(getattr(args, "rollout_num_chunks", 1))
+        self.score_context_noise_boundaries = list(
+            getattr(args, "score_context_noise_frame_boundaries", []) or []
+        )
+        self.score_context_noise_values = list(
+            getattr(args, "score_context_noise_frame_values", []) or []
+        )
+        if self.score_context_noise_boundaries and len(
+            self.score_context_noise_values
+        ) != len(self.score_context_noise_boundaries) + 1:
+            raise ValueError("Invalid score context noise schedule")
+        self.rollout_mean_weight = float(
+            getattr(args, "rollout_first_gt_latent_mean_loss_weight", 0.0)
+        )
+        self.rollout_std_weight = float(
+            getattr(args, "rollout_first_gt_latent_std_loss_weight", 0.0)
+        )
+        self._rollout_states = {}
 
         if self.context_matched_distillation:
             if getattr(args, "model_family", "wan") != "cosmos":
@@ -57,6 +75,15 @@ class ContextMatchedDistillation(SelfForcingModel):
                 )
             if self.prefix_noise < 0:
                 raise ValueError("prefix_noise must be non-negative")
+            rollout_frames = (
+                self.rollout_num_chunks * int(args.image_or_video_shape[1])
+            )
+            if self.rollout_num_chunks > 1 and (
+                self.num_frame_per_block != 1
+                or rollout_frames > self.num_training_frames
+                or rollout_frames > 128
+            ):
+                raise ValueError("Invalid rollout geometry")
 
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
@@ -113,18 +140,39 @@ class ContextMatchedDistillation(SelfForcingModel):
             gradient_mask = gradient_mask[:, suffix_start:]
         return scored_suffix, prefix, gradient_mask
 
-    def _noise_prefix(self, prefix: torch.Tensor) -> torch.Tensor:
-        prefix_timestep = torch.full(
-            prefix.shape[:2],
-            self.prefix_noise,
+    def _prefix_timesteps(self, prefix: torch.Tensor, start: int) -> torch.Tensor:
+        if not self.score_context_noise_boundaries:
+            return torch.full(
+                prefix.shape[:2], self.prefix_noise,
+                device=prefix.device, dtype=torch.float32,
+            )
+        indices = torch.arange(
+            start, start + prefix.shape[1], device=prefix.device
+        )
+        buckets = torch.bucketize(
+            indices,
+            torch.tensor(
+                self.score_context_noise_boundaries, device=prefix.device
+            ),
+            right=True,
+        )
+        values = torch.tensor(
+            self.score_context_noise_values,
             device=prefix.device,
             dtype=torch.float32,
         )
-        return self.scheduler.add_noise(
+        return values[buckets].expand(prefix.shape[0], -1)
+
+    def _noise_prefix(self, prefix: torch.Tensor, start: int):
+        prefix_timestep = self._prefix_timesteps(prefix, start)
+        if prefix.shape[1] == 0:
+            return prefix, prefix_timestep
+        noised_prefix = self.scheduler.add_noise(
             prefix.flatten(0, 1),
             torch.randn_like(prefix.flatten(0, 1)),
             prefix_timestep.flatten(0, 1),
         ).unflatten(0, prefix.shape[:2])
+        return noised_prefix, prefix_timestep
 
     def _score_with_prefix(
         self,
@@ -133,8 +181,9 @@ class ContextMatchedDistillation(SelfForcingModel):
         timestep: torch.Tensor,
         conditional_dict: dict,
         noised_history: Optional[torch.Tensor],
+        history_timestep: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Score the suffix in one full-sequence teacher-forcing model call."""
+        """Score the suffix with history and noisy targets packed together."""
         if not self.context_matched_distillation:
             return score_model(
                 noisy_image_or_video=noisy_suffix,
@@ -147,71 +196,66 @@ class ContextMatchedDistillation(SelfForcingModel):
             raise ValueError(
                 "Context-Matched Distillation requires one initial I2V latent"
             )
-        suffix_frames = noisy_suffix.shape[1]
         if noised_history is None:
             raise ValueError(
                 "Context-Matched Distillation requires noised student history"
             )
-        base_prefix_frames = noised_history.shape[1] - suffix_frames + 1
-        if base_prefix_frames < 0:
-            raise ValueError(
-                "Context-Matched Distillation received invalid student history"
-            )
+        if history_timestep is None:
+            raise ValueError("Context-Matched Distillation requires history timesteps")
 
         initial_latent = initial_latent.to(
             device=noisy_suffix.device,
             dtype=noisy_suffix.dtype,
         )
-        prefix_timestep = torch.full(
-            (timestep.shape[0], 1),
-            self.prefix_noise,
-            device=timestep.device,
-            dtype=timestep.dtype,
-        )
-        context_prefix = noised_history[:, :base_prefix_frames]
-        noisy_full = torch.cat(
-            [initial_latent, context_prefix, noisy_suffix],
+        context = torch.cat(
+            [initial_latent, noised_history],
             dim=1,
         )
-
-        # Clean K/V is only visible to later blocks.  The final placeholder is
-        # therefore never consumed as clean context, but keeps both streams the
-        # same length so they share positions and block boundaries.
-        clean_placeholder = noisy_suffix[:, -1:].detach()
-        teacher_context = torch.cat(
-            [initial_latent, noised_history, clean_placeholder],
-            dim=1,
-        )
-        if teacher_context.shape != noisy_full.shape:
-            raise RuntimeError("Teacher-forcing streams have mismatched shapes")
-
-        noisy_timestep = torch.cat(
+        context_timestep = torch.cat(
             [
-                torch.zeros_like(prefix_timestep),
-                prefix_timestep.expand(-1, base_prefix_frames),
-                timestep,
+                torch.zeros_like(timestep[:, :1]),
+                history_timestep.to(timestep.dtype),
             ],
             dim=1,
         )
-        teacher_timestep = torch.cat(
-            [
-                torch.zeros_like(prefix_timestep),
-                prefix_timestep.expand(-1, teacher_context.shape[1] - 1),
-            ],
-            dim=1,
-        )
+        suffix_start = context.shape[1]
         flow_pred, x0_pred = score_model(
-            noisy_image_or_video=noisy_full,
+            noisy_image_or_video=torch.cat([context, noisy_suffix], dim=1),
             conditional_dict=conditional_dict,
-            timestep=noisy_timestep,
-            clean_x=teacher_context,
-            aug_t=teacher_timestep,
+            timestep=torch.cat([context_timestep, timestep], dim=1),
+            clean_x=context,
+            aug_t=context_timestep,
+            teacher_forcing_start=suffix_start,
         )
-        suffix_start = 1 + base_prefix_frames
         return (
             flow_pred[:, suffix_start:],
             x0_pred[:, suffix_start:],
         )
+
+    def _score_cfg_pair(
+        self,
+        score_model,
+        noisy_image_or_video,
+        timestep,
+        conditional_dict,
+        unconditional_dict,
+        noised_history,
+        history_timestep,
+    ):
+        batch_size = noisy_image_or_video.shape[0]
+        conditioning = {
+            key: torch.cat([value, unconditional_dict[key]], dim=0)
+            for key, value in conditional_dict.items()
+        }
+        _, prediction = self._score_with_prefix(
+            score_model,
+            torch.cat([noisy_image_or_video, noisy_image_or_video], dim=0),
+            torch.cat([timestep, timestep], dim=0),
+            conditioning,
+            torch.cat([noised_history, noised_history], dim=0),
+            torch.cat([history_timestep, history_timestep], dim=0),
+        )
+        return prediction[:batch_size], prediction[batch_size:]
 
     def _compute_kl_grad(
         self, noisy_image_or_video: torch.Tensor,
@@ -219,6 +263,7 @@ class ContextMatchedDistillation(SelfForcingModel):
         timestep: torch.Tensor,
         conditional_dict: dict, unconditional_dict: dict,
         noised_history: Optional[torch.Tensor] = None,
+        history_timestep: Optional[torch.Tensor] = None,
         normalization: bool = True
     ) -> Tuple[torch.Tensor, dict]:
         """
@@ -235,45 +280,40 @@ class ContextMatchedDistillation(SelfForcingModel):
             - kl_log_dict: a dictionary containing the intermediate tensors for logging.
         """
         # Step 1: Compute the fake score
-        _, pred_fake_image_cond = self._score_with_prefix(
-            self.fake_score,
-            noisy_image_or_video,
-            timestep,
-            conditional_dict,
-            noised_history,
-        )
-
         if self.fake_guidance_scale != 0.0:
-            _, pred_fake_image_uncond = self._score_with_prefix(
+            pred_fake_image_cond, pred_fake_image_uncond = self._score_cfg_pair(
                 self.fake_score,
                 noisy_image_or_video,
                 timestep,
+                conditional_dict,
                 unconditional_dict,
                 noised_history,
+                history_timestep,
             )
             pred_fake_image = pred_fake_image_cond + (
                 pred_fake_image_cond - pred_fake_image_uncond
             ) * self.fake_guidance_scale
         else:
-            pred_fake_image = pred_fake_image_cond
+            _, pred_fake_image = self._score_with_prefix(
+                self.fake_score,
+                noisy_image_or_video,
+                timestep,
+                conditional_dict,
+                noised_history,
+                history_timestep,
+            )
 
         # Step 2: Compute the real score
         # We compute the conditional and unconditional prediction
         # and add them together to achieve cfg (https://arxiv.org/abs/2207.12598)
-        _, pred_real_image_cond = self._score_with_prefix(
+        pred_real_image_cond, pred_real_image_uncond = self._score_cfg_pair(
             self.real_score,
             noisy_image_or_video,
             timestep,
             conditional_dict,
-            noised_history,
-        )
-
-        _, pred_real_image_uncond = self._score_with_prefix(
-            self.real_score,
-            noisy_image_or_video,
-            timestep,
             unconditional_dict,
             noised_history,
+            history_timestep,
         )
 
         pred_real_image = pred_real_image_cond + (
@@ -302,6 +342,7 @@ class ContextMatchedDistillation(SelfForcingModel):
         conditional_dict: dict,
         unconditional_dict: dict,
         prefix: Optional[torch.Tensor] = None,
+        prefix_start: int = 1,
         gradient_mask: Optional[torch.Tensor] = None,
         denoised_timestep_from: int = 0,
         denoised_timestep_to: int = 0
@@ -331,7 +372,7 @@ class ContextMatchedDistillation(SelfForcingModel):
                 batch_size,
                 num_frame,
                 self.num_frame_per_block,
-                uniform_timestep=True
+                uniform_timestep=True,
             )
 
             # TODO:should we change it to `timestep = self.scheduler.timesteps[timestep]`?
@@ -347,12 +388,8 @@ class ContextMatchedDistillation(SelfForcingModel):
                 noise.flatten(0, 1),
                 timestep.flatten(0, 1)
             ).detach().unflatten(0, (batch_size, num_frame))
-            noised_history = (
-                self._noise_prefix(
-                    torch.cat([prefix, image_or_video[:, :-1].detach()], dim=1)
-                )
-                if self.context_matched_distillation
-                else None
+            noised_history, history_timestep = self._noise_prefix(
+                prefix, prefix_start
             )
 
             # Step 2: Compute the KL grad
@@ -363,6 +400,7 @@ class ContextMatchedDistillation(SelfForcingModel):
                 conditional_dict=conditional_dict,
                 unconditional_dict=unconditional_dict,
                 noised_history=noised_history,
+                history_timestep=history_timestep,
             )
 
         if gradient_mask is not None:
@@ -373,13 +411,114 @@ class ContextMatchedDistillation(SelfForcingModel):
             ), (original_latent.double() - grad.double()).detach(), reduction="mean")
         return dmd_loss, dmd_log_dict
 
+    def reset_rollout_state(self):
+        self._rollout_states.clear()
+
+    def _run_rollout_generator(
+        self,
+        image_or_video_shape,
+        conditional_dict,
+        initial_latent,
+        chunk_index,
+        phase,
+    ):
+        if chunk_index == 0:
+            self._rollout_states[phase] = {"history": None, "exit_step": None}
+        state = self._rollout_states[phase]
+        history = state["history"]
+        if history is None:
+            prefix = initial_latent[:, :0]
+            prefix_start = 1
+            context = None
+            chunk_initial = initial_latent
+            generated_frames = image_or_video_shape[1] - 1
+        else:
+            available = history[:, 1:]
+            window_frames = int(image_or_video_shape[1]) - 1
+            prefix = available[:, -window_frames:].detach()
+            prefix_start = history.shape[1]
+            context = history[:, -window_frames:].detach()
+            chunk_initial = None
+            generated_frames = image_or_video_shape[1]
+
+        if self.inference_pipeline is None:
+            self._initialize_inference_pipeline()
+        noise_shape = list(image_or_video_shape)
+        noise_shape[1] = generated_frames
+        output, denoised_from, denoised_to, sim_step = (
+            self.inference_pipeline.inference_with_trajectory(
+                noise=torch.randn(
+                    noise_shape, device=self.device, dtype=self.dtype
+                ),
+                initial_latent=chunk_initial,
+                context_latents=context,
+                exit_step=state["exit_step"],
+                return_sim_step=True,
+                **{
+                    key: value
+                    for key, value in conditional_dict.items()
+                    if key != "initial_latent"
+                },
+            )
+        )
+        state["exit_step"] = sim_step - 1
+        generated = output[:, -generated_frames:].to(self.dtype)
+        state["history"] = (
+            torch.cat([initial_latent, generated.detach()], dim=1)
+            if history is None
+            else torch.cat([history, generated.detach()], dim=1)
+        )
+        return generated, prefix, prefix_start, None, denoised_from, denoised_to
+
+    def _generate_for_loss(
+        self,
+        image_or_video_shape,
+        conditional_dict,
+        initial_latent,
+        chunk_index,
+        phase,
+    ):
+        if chunk_index is not None:
+            return self._run_rollout_generator(
+                image_or_video_shape,
+                conditional_dict,
+                initial_latent,
+                chunk_index,
+                phase,
+            )
+        pred, mask, denoised_from, denoised_to = self._run_generator(
+            image_or_video_shape=image_or_video_shape,
+            conditional_dict=conditional_dict,
+            initial_latent=initial_latent,
+            return_full_rollout=True,
+        )
+        pred, prefix, mask = self._split_context_matched_rollout(pred, mask)
+        return pred, prefix, 1, mask, denoised_from, denoised_to
+
+    def _rollout_anchor_loss(self, generated, reference):
+        dims = (1, 3, 4)
+        generated = generated.float()
+        reference = reference[:, :generated.shape[1]].float()
+        mean_loss = F.l1_loss(
+            generated.mean(dims), reference.mean(dims)
+        )
+        std_loss = F.l1_loss(
+            generated.std(dims, unbiased=False),
+            reference.std(dims, unbiased=False),
+        )
+        return (
+            self.rollout_mean_weight * mean_loss
+            + self.rollout_std_weight * std_loss
+        )
+
     def generator_loss(
         self,
         image_or_video_shape,
         conditional_dict: dict,
         unconditional_dict: dict,
         clean_latent: torch.Tensor,
-        initial_latent: torch.Tensor = None
+        initial_latent: torch.Tensor = None,
+        rollout_chunk_index: Optional[int] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Generate image/videos from noise and compute the DMD loss.
@@ -395,19 +534,20 @@ class ContextMatchedDistillation(SelfForcingModel):
             - loss: a scalar tensor representing the generator loss.
             - generator_log_dict: a dictionary containing the intermediate tensors for logging.
         """
-        # Step 1: Unroll generator to obtain fake videos
-        pred_image, gradient_mask, denoised_timestep_from, denoised_timestep_to = self._run_generator(
-            image_or_video_shape=image_or_video_shape,
-            conditional_dict=conditional_dict,
-            initial_latent=initial_latent,
-            return_full_rollout=self.context_matched_distillation,
+        (
+            pred_image,
+            prefix,
+            prefix_start,
+            gradient_mask,
+            denoised_timestep_from,
+            denoised_timestep_to,
+        ) = self._generate_for_loss(
+            image_or_video_shape,
+            conditional_dict,
+            initial_latent,
+            rollout_chunk_index,
+            "generator",
         )
-        prefix = None
-        if self.context_matched_distillation:
-            pred_image, prefix, gradient_mask = self._split_context_matched_rollout(
-                pred_image,
-                gradient_mask,
-            )
 
         # Step 2: Compute the DMD loss
         dmd_loss, dmd_log_dict = self.compute_distribution_matching_loss(
@@ -415,10 +555,21 @@ class ContextMatchedDistillation(SelfForcingModel):
             conditional_dict=conditional_dict,
             unconditional_dict=unconditional_dict,
             prefix=prefix,
+            prefix_start=prefix_start,
             gradient_mask=gradient_mask,
             denoised_timestep_from=denoised_timestep_from,
             denoised_timestep_to=denoised_timestep_to
         )
+        if rollout_chunk_index is not None and (
+            self.rollout_mean_weight or self.rollout_std_weight
+        ):
+            anchor_input = (
+                torch.cat([initial_latent, pred_image], dim=1)
+                if rollout_chunk_index == 0 else pred_image
+            )
+            dmd_loss = dmd_loss + self._rollout_anchor_loss(
+                anchor_input, clean_latent
+            )
 
         return dmd_loss, dmd_log_dict
 
@@ -428,7 +579,8 @@ class ContextMatchedDistillation(SelfForcingModel):
         conditional_dict: dict,
         unconditional_dict: dict,
         clean_latent: torch.Tensor,
-        initial_latent: torch.Tensor = None
+        initial_latent: torch.Tensor = None,
+        rollout_chunk_index: Optional[int] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Generate image/videos from noise and train the critic with generated samples.
@@ -447,18 +599,20 @@ class ContextMatchedDistillation(SelfForcingModel):
 
         # Step 1: Run generator on backward simulated noisy input
         with torch.no_grad():
-            generated_image, gradient_mask, denoised_timestep_from, denoised_timestep_to = self._run_generator(
-                image_or_video_shape=image_or_video_shape,
-                conditional_dict=conditional_dict,
-                initial_latent=initial_latent,
-                return_full_rollout=self.context_matched_distillation,
+            (
+                generated_image,
+                prefix,
+                prefix_start,
+                _,
+                denoised_timestep_from,
+                denoised_timestep_to,
+            ) = self._generate_for_loss(
+                image_or_video_shape,
+                conditional_dict,
+                initial_latent,
+                rollout_chunk_index,
+                "critic",
             )
-            prefix = None
-            if self.context_matched_distillation:
-                generated_image, prefix, _ = self._split_context_matched_rollout(
-                    generated_image,
-                    gradient_mask,
-                )
 
         # Step 2: Compute the fake prediction
         min_timestep = denoised_timestep_to if self.ts_schedule and denoised_timestep_to is not None else self.min_score_timestep
@@ -469,7 +623,7 @@ class ContextMatchedDistillation(SelfForcingModel):
             generated_image.shape[0],
             generated_image.shape[1],
             self.num_frame_per_block,
-            uniform_timestep=True
+            uniform_timestep=True,
         )
 
         if self.timestep_shift > 1:
@@ -485,12 +639,9 @@ class ContextMatchedDistillation(SelfForcingModel):
             critic_timestep.flatten(0, 1)
         ).unflatten(0, generated_image.shape[:2])
 
-        noised_history = (
-            self._noise_prefix(
-                torch.cat([prefix, generated_image[:, :-1]], dim=1)
-            )
-            if self.context_matched_distillation
-            else None
+        noised_history, history_timestep = self._noise_prefix(
+            prefix,
+            prefix_start,
         )
         pred_fake_flow, pred_fake_image = self._score_with_prefix(
             self.fake_score,
@@ -498,6 +649,7 @@ class ContextMatchedDistillation(SelfForcingModel):
             critic_timestep,
             conditional_dict,
             noised_history,
+            history_timestep,
         )
 
         # Step 3: Compute the denoising loss for the fake critic

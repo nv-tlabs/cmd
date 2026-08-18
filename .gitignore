@@ -5,3 +5,5 @@ wan_models
 checkpoints
 data/
 logs/
+/srun.local.sh
+/examples/outputs/

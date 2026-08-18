@@ -53,7 +53,7 @@ def fsdp_state_dict(model):
 
 
 def create_fsdp2_device_mesh():
-    """Create the one-dimensional world mesh used by FSDP2 score models."""
+    """Create the one-dimensional world mesh used by Cosmos FSDP2 models."""
     if not dist.is_initialized():
         raise RuntimeError("FSDP2 requires an initialized process group")
 
@@ -66,14 +66,8 @@ def create_fsdp2_device_mesh():
     )
 
 
-def fsdp2_wrap_cosmos_score(module, mesh, mixed_precision=False):
-    """Shard a Cosmos score wrapper at explicit transformer boundaries.
-
-    The two-pass teacher-forcing forward invokes every transformer block once
-    for clean context and once for noisy inputs.  Re-sharding every block after
-    each call makes those repeated calls follow FSDP2's normal module lifecycle
-    instead of retaining FSDP1 all-gather state across the two passes.
-    """
+def fsdp2_wrap_cosmos_model(module, mesh, mixed_precision=False):
+    """Shard a Cosmos diffusion wrapper at transformer boundaries."""
     from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
     if not hasattr(module, "model") or not hasattr(module.model, "blocks"):
@@ -135,7 +129,7 @@ def fsdp2_wrap_cosmos_score(module, mesh, mixed_precision=False):
 
 @torch.no_grad()
 def distributed_clip_grad_norm_(module, max_norm, norm_type=2.0):
-    """Clip gradients for either legacy FSDP or the FSDP2 score wrapper."""
+    """Clip gradients for either legacy FSDP or a Cosmos FSDP2 wrapper."""
     if not getattr(module, "_self_forcing_uses_fsdp2", False):
         return module.clip_grad_norm_(max_norm, norm_type=norm_type)
     if float(norm_type) != 2.0:
@@ -213,7 +207,6 @@ def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_stra
     sharding_strategy = {
         "full": ShardingStrategy.FULL_SHARD,
         "hybrid_full": ShardingStrategy.HYBRID_SHARD,
-        "hybrid_zero2": ShardingStrategy._HYBRID_SHARD_ZERO2,
         "no_shard": ShardingStrategy.NO_SHARD,
     }[sharding_strategy]
 

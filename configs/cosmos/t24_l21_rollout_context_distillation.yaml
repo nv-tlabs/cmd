@@ -1,0 +1,101 @@
+# Stage 3: extend the distilled T24/L21 student over six cached sections.
+generator_ckpt: checkpoints/chunk1_short_t24_l21.safetensors
+teacher_ckpt: checkpoints/chunk1_teacher_t24_l21.safetensors
+model_family: cosmos
+real_name: nvidia/Cosmos-Predict2.5-2B
+fake_name: nvidia/Cosmos-Predict2.5-2B
+text_encoder_name: nvidia/Cosmos-Reason1-7B
+vae_model_name: nvidia/Cosmos-Predict2.5-2B
+
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+sharding_strategy: hybrid_full
+mixed_precision: true
+gradient_checkpointing: true
+
+trainer: score_distillation
+distribution_loss: context_matched
+denoising_loss_type: flow
+num_train_timestep: 1000
+timestep_shift: 5.0
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: true
+same_step_across_blocks: true
+last_step_only: false
+ts_schedule: false
+real_guidance_scale: 4.0
+fake_guidance_scale: 0.0
+
+# The first section contains the clean I2V frame and 20 generated latents;
+# later sections each contain 21 generated latents. Six sections produce a
+# 126-latent trajectory, which decodes to 501 pixel frames.
+rollout_num_chunks: 6
+num_training_frames: 126
+image_or_video_shape: [1, 21, 16, 60, 104]
+num_frame_per_block: 1
+i2v: true
+independent_first_frame: true
+
+# Keep the latest student section as generated context. Score-model history is
+# packed with the current section in one block-masked traversal.
+context_noise: 128
+prefix_noise: 256
+score_context_noise_frame_boundaries: [2, 8, 20]
+score_context_noise_frame_values: [0, 128, 256, 512]
+
+# Match each generated section to the per-channel mean and standard deviation
+# of the first ground-truth section.
+rollout_first_gt_latent_mean_loss_weight: 0.5
+rollout_first_gt_latent_std_loss_weight: 0.5
+
+model_kwargs:
+  model_name: nvidia/Cosmos-Predict2.5-2B
+  checkpoint_filename: base/post-trained/81edfebe-bd6a-4039-8c1d-737df1a790bf_ema_bf16.pt
+  timestep_shift: 5.0
+  i2v: true
+  local_attn_size: 21
+  sink_size: 0
+
+data_path: data/cosmos_i2v_lmdb_t24
+load_raw_video: false
+batch_size: 1
+dataloader_num_workers: 1
+
+lr: 2.0e-06
+lr_critic: 4.0e-07
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+weight_decay: 0.01
+max_grad_norm_generator: 10.0
+max_grad_norm_critic: 10.0
+grad_accum_iter: 1
+dfake_gen_update_ratio: 5
+
+seed: 0
+ema_weight: 0.0
+ema_start_step: 200
+max_steps: 60000
+log_iters: 60
+gc_interval: 100
+validation_interval: 50
+validation_at_start: true
+validation_seed: 12345
+validation_fps: 16
+
+wandb_host: ${oc.env:WANDB_BASE_URL,https://api.wandb.ai}
+wandb_key: null
+wandb_entity: ${oc.env:WANDB_ENTITY,null}
+wandb_project: ${oc.env:WANDB_PROJECT,causal-cosmos25}
+negative_prompt: >-
+  The video captures a series of frames showing ugly scenes, static with no
+  motion, motion blur, over-saturation, shaky footage, low resolution, grainy
+  texture, pixelated images, poorly lit areas, underexposed and overexposed
+  scenes, poor color balance, washed out colors, choppy sequences, jerky
+  movements, low frame rate, artifacting, color banding, unnatural transitions,
+  outdated special effects, fake elements, unconvincing visuals, poorly edited
+  content, jump cuts, visual noise, and flickering. Overall, the video is of
+  poor quality.

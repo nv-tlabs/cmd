@@ -57,12 +57,13 @@ class CosmosValidationCallback:
         trainer.model.generator.eval()
         trainer.model.text_encoder.eval()
 
-        latent_frames = int(self.config.image_or_video_shape[1])
+        ground_truth_frames = int(ground_truth.shape[1])
+        latent_frames = int(trainer.model.num_training_frames)
         latent_shape = tuple(self.config.image_or_video_shape[2:])
-        if tuple(ground_truth.shape[1:]) != (latent_frames, *latent_shape):
+        if tuple(ground_truth.shape[2:]) != latent_shape:
             raise ValueError(
-                "Validation latent shape mismatch: expected "
-                f"{(latent_frames, *latent_shape)}, got {tuple(ground_truth.shape[1:])}"
+                "Validation latent shape mismatch: expected channel/spatial "
+                f"shape {latent_shape}, got {tuple(ground_truth.shape[2:])}"
             )
 
         pipeline = CausalInferencePipeline(
@@ -145,24 +146,41 @@ class CosmosValidationCallback:
                 "validation/wall_time_seconds": time.monotonic() - started_at,
             }
             for sample_index, prompt in enumerate(prompts):
-                comparison = torch.cat(
-                    [ground_truth_video[sample_index], generated_video[sample_index]],
-                    dim=-1,
-                ).numpy()
                 prefix = f"validation/train_batch_{sample_index:02d}"
-                wandb_log[f"{prefix}/gt_vs_generated"] = wandb.Video(
-                    comparison,
-                    fps=self.fps,
-                    format="mp4",
-                    caption=(
-                        "Left: ground truth | Right: generated\n"
-                        f"{prompt}"
-                    ),
-                )
+                if latent_frames == ground_truth_frames:
+                    comparison = torch.cat(
+                        [
+                            ground_truth_video[sample_index],
+                            generated_video[sample_index],
+                        ],
+                        dim=-1,
+                    ).numpy()
+                    wandb_log[f"{prefix}/gt_vs_generated"] = wandb.Video(
+                        comparison,
+                        fps=self.fps,
+                        format="mp4",
+                        caption=(
+                            "Left: ground truth | Right: generated\n"
+                            f"{prompt}"
+                        ),
+                    )
+                else:
+                    wandb_log[f"{prefix}/ground_truth"] = wandb.Video(
+                        ground_truth_video[sample_index].numpy(),
+                        fps=self.fps,
+                        format="mp4",
+                        caption=prompt,
+                    )
+                    wandb_log[f"{prefix}/generated_rollout"] = wandb.Video(
+                        generated_video[sample_index].numpy(),
+                        fps=self.fps,
+                        format="mp4",
+                        caption=prompt,
+                    )
                 wandb_log[f"{prefix}/prompt"] = prompt
             wandb.log(wandb_log, step=trainer.step)
             trainer.model.vae.to("cpu")
-            del generated_video, ground_truth_video, comparison, wandb_log
+            del generated_video, ground_truth_video, wandb_log
             torch.cuda.empty_cache()
             print(f"Finished causal I2V validation at step {trainer.step}", flush=True)
 

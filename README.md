@@ -15,7 +15,9 @@
 
 <p align="center">
   <sup>1</sup>NVIDIA &nbsp;&nbsp; <sup>2</sup>SketchX, CVSSP, University of Surrey<br>
-  <a href="https://hmrishavbandy.github.io/cmd-site/">Project Page</a>
+  <a href="https://hmrishavbandy.github.io/cmd-site/">Project Page</a> &nbsp;|&nbsp;
+  <a href="https://arxiv.org/abs/2608.13391">arXiv</a> &nbsp;|&nbsp;
+  <a href="https://huggingface.co/nvidia/cmd">Hugging Face</a>
 </p>
 
 ## Setup

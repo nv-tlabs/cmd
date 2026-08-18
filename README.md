@@ -13,12 +13,19 @@
   <strong>Zian Wang<sup>1</sup></strong>
 </p>
 
+
 <p align="center">
   <sup>1</sup>NVIDIA &nbsp;&nbsp; <sup>2</sup>SketchX, CVSSP, University of Surrey<br>
   <a href="https://hmrishavbandy.github.io/cmd-site/">Project Page</a> &nbsp;|&nbsp;
   <a href="https://arxiv.org/abs/2608.13391">arXiv</a> &nbsp;|&nbsp;
   <a href="https://huggingface.co/nvidia/cmd">Hugging Face</a>
 </p>
+
+
+
+https://github.com/user-attachments/assets/a35265f9-ac64-4fa4-bc87-8166fc2ee338
+
+
 
 ## Setup
 

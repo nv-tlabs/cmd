@@ -498,13 +498,13 @@ class ContextMatchedDistillation(SelfForcingModel):
     def _rollout_anchor_loss(self, generated, reference):
         dims = (1, 3, 4)
         generated = generated.float()
-        reference = reference[:, :generated.shape[1]].float()
+        reference = reference[:, 1:1 + generated.shape[1]].detach().float()
         mean_loss = F.l1_loss(
             generated.mean(dims), reference.mean(dims)
         )
         std_loss = F.l1_loss(
-            generated.std(dims, unbiased=False),
-            reference.std(dims, unbiased=False),
+            (generated.var(dims, unbiased=False) + 1e-6).sqrt(),
+            (reference.var(dims, unbiased=False) + 1e-6).sqrt(),
         )
         return (
             self.rollout_mean_weight * mean_loss
@@ -563,12 +563,8 @@ class ContextMatchedDistillation(SelfForcingModel):
         if rollout_chunk_index is not None and (
             self.rollout_mean_weight or self.rollout_std_weight
         ):
-            anchor_input = (
-                torch.cat([initial_latent, pred_image], dim=1)
-                if rollout_chunk_index == 0 else pred_image
-            )
             dmd_loss = dmd_loss + self._rollout_anchor_loss(
-                anchor_input, clean_latent
+                pred_image, clean_latent
             )
 
         return dmd_loss, dmd_log_dict
